@@ -1,0 +1,347 @@
+{
+ "fps": 30,
+ "total": 673,
+ "lines": {
+  "hook": {
+   "say": "This isn't footage.",
+   "from": 8,
+   "to": 38,
+   "words": [
+    [
+     "this",
+     8,
+     13
+    ],
+    [
+     "isn't",
+     13,
+     24
+    ],
+    [
+     "footage",
+     24,
+     30
+    ]
+   ]
+  },
+  "blender": {
+   "say": "No, it's not Blender.",
+   "from": 44,
+   "to": 77,
+   "words": [
+    [
+     "no",
+     44,
+     50
+    ],
+    [
+     "it's",
+     53,
+     56
+    ],
+    [
+     "not",
+     56,
+     60
+    ],
+    [
+     "blender",
+     60,
+     72
+    ]
+   ]
+  },
+  "code": {
+   "say": "It's code.",
+   "from": 83,
+   "to": 104,
+   "words": [
+    [
+     "it's",
+     83,
+     89
+    ],
+    [
+     "code",
+     89,
+     97
+    ]
+   ]
+  },
+  "every": {
+   "say": "Every frame of it.",
+   "from": 107,
+   "to": 133,
+   "words": [
+    [
+     "every",
+     107,
+     114
+    ],
+    [
+     "frame",
+     114,
+     123
+    ],
+    [
+     "of",
+     123,
+     129
+    ],
+    [
+     "it",
+     129,
+     132
+    ]
+   ]
+  },
+  "ask": {
+   "say": "Ask Claude for 3D, you get this.",
+   "from": 150,
+   "to": 204,
+   "words": [
+    [
+     "ask",
+     150,
+     158
+    ],
+    [
+     "claude",
+     158,
+     165
+    ],
+    [
+     "for",
+     165,
+     170
+    ],
+    [
+     "3d",
+     170,
+     182
+    ],
+    [
+     "you",
+     186,
+     188
+    ],
+    [
+     "get",
+     188,
+     192
+    ],
+    [
+     "this",
+     192,
+     199
+    ]
+   ]
+  },
+  "give": {
+   "say": "Give Claude my skill, and it thinks like an animator.",
+   "from": 229,
+   "to": 310,
+   "words": [
+    [
+     "give",
+     229,
+     235
+    ],
+    [
+     "claude",
+     235,
+     243
+    ],
+    [
+     "my",
+     243,
+     250
+    ],
+    [
+     "skill",
+     250,
+     260
+    ],
+    [
+     "and",
+     268,
+     271
+    ],
+    [
+     "it",
+     271,
+     275
+    ],
+    [
+     "thinks",
+     275,
+     279
+    ],
+    [
+     "like",
+     279,
+     288
+    ],
+    [
+     "an",
+     288,
+     291
+    ],
+    [
+     "animator",
+     291,
+     306
+    ]
+   ]
+  },
+  "camera": {
+   "say": "Camera.",
+   "from": 319,
+   "to": 337,
+   "words": [
+    [
+     "camera",
+     319,
+     329
+    ]
+   ]
+  },
+  "light": {
+   "say": "Light.",
+   "from": 358,
+   "to": 372,
+   "words": [
+    [
+     "light",
+     358,
+     366
+    ]
+   ]
+  },
+  "motion": {
+   "say": "Motion.",
+   "from": 393,
+   "to": 411,
+   "words": [
+    [
+     "motion",
+     393,
+     404
+    ]
+   ]
+  },
+  "sound": {
+   "say": "Sound.",
+   "from": 432,
+   "to": 449,
+   "words": [
+    [
+     "sound",
+     432,
+     440
+    ]
+   ]
+  },
+  "one": {
+   "say": "One skill file.",
+   "from": 467,
+   "to": 496,
+   "words": [
+    [
+     "one",
+     467,
+     473
+    ],
+    [
+     "skill",
+     473,
+     481
+    ],
+    [
+     "file",
+     481,
+     491
+    ]
+   ]
+  },
+  "writes": {
+   "say": "Claude writes all the code.",
+   "from": 505,
+   "to": 541,
+   "words": [
+    [
+     "claude",
+     505,
+     512
+    ],
+    [
+     "writes",
+     512,
+     520
+    ],
+    [
+     "all",
+     520,
+     525
+    ],
+    [
+     "the",
+     525,
+     529
+    ],
+    [
+     "code",
+     529,
+     536
+    ]
+   ]
+  },
+  "cta": {
+   "say": "Comment skill, and I'll send you the file.",
+   "from": 586,
+   "to": 640,
+   "words": [
+    [
+     "comment",
+     586,
+     595
+    ],
+    [
+     "skill",
+     595,
+     604
+    ],
+    [
+     "and",
+     611,
+     611
+    ],
+    [
+     "i'll",
+     611,
+     617
+    ],
+    [
+     "send",
+     617,
+     621
+    ],
+    [
+     "you",
+     621,
+     625
+    ],
+    [
+     "the",
+     625,
+     629
+    ],
+    [
+     "file",
+     629,
+     635
+    ]
+   ]
+  }
+ }
+}

@@ -1,0 +1,143 @@
+{
+  "model": "opus",
+  "effortLevel": "high",
+  "autoUpdatesChannel": "latest",
+  "autoMemoryEnabled": true,
+  "permissions": {
+    "allow": [
+      "Read",
+      "Edit",
+      "Write",
+      "Glob",
+      "Grep",
+      "WebFetch",
+      "WebSearch",
+      "Bash(git *)",
+      "Bash(npm *)",
+      "Bash(pnpm *)",
+      "Bash(pip *)",
+      "Bash(pip3 *)",
+      "Bash(ls *)",
+      "Bash(cat *)",
+      "Bash(head *)",
+      "Bash(tail *)",
+      "Bash(wc *)",
+      "Bash(find *)",
+      "Bash(grep *)",
+      "Bash(rg *)",
+      "Bash(which *)",
+      "Bash(echo *)",
+      "Bash(printf *)",
+      "Bash(mkdir *)",
+      "Bash(cp *)",
+      "Bash(mv *)",
+      "Bash(touch *)",
+      "Bash(diff *)",
+      "Bash(sort *)",
+      "Bash(uniq *)",
+      "Bash(cut *)",
+      "Bash(sed *)",
+      "Bash(awk *)",
+      "Bash(jq *)",
+      "Bash(tree *)",
+      "Bash(du *)",
+      "Bash(df *)",
+      "Bash(ps *)",
+      "Bash(date*)",
+      "Bash(stat *)",
+      "Bash(realpath *)",
+      "Bash(file *)",
+      "Bash(uname *)",
+      "Bash(whoami*)",
+      "Bash(basename *)",
+      "Bash(dirname *)",
+      "Bash(tar *)",
+      "Bash(unzip *)",
+      "Bash(sqlite3 *)",
+      "Bash(docker *)",
+      "Bash(ffmpeg *)",
+      "Bash(ffprobe *)",
+      "Bash(magick *)"
+    ],
+    "ask": [
+      "Bash(npm publish*)",
+      "Bash(pnpm publish*)",
+      "Bash(pip install git+*)",
+      "Bash(pip install http*)",
+      "Bash(kubectl delete *)"
+    ],
+    "deny": [
+      "Bash(git push --force*)",
+      "Bash(git push * --force*)",
+      "Bash(git push -f*)",
+      "Bash(git push * -f*)",
+      "Bash(git reset --hard origin/*)",
+      "Bash(git clean -f*)",
+      "Bash(git clean -d*)",
+      "Bash(git clean -x*)",
+      "Bash(git clean * -f*)",
+      "Bash(git reflog expire*)",
+      "Bash(git gc --prune=now*)",
+      "Bash(git filter-branch*)",
+      "Bash(git update-ref -d *)",
+      "Bash(rm -rf /)",
+      "Bash(rm -rf /*)",
+      "Bash(rm -rf ~)",
+      "Bash(rm -rf ~/*)",
+      "Bash(sudo rm -r*)",
+      "Bash(sudo rm -f*)",
+      "Bash(mkfs*)",
+      "Bash(sudo mkfs*)",
+      "Bash(dd *of=/dev/*)",
+      "Bash(sudo dd *of=/dev/*)",
+      "Bash(diskutil eraseDisk*)",
+      "Bash(diskutil eraseVolume*)",
+      "Bash(wipefs*)",
+      "Bash(shred*)",
+      "Bash(gh gist create*)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"{{NODE}}\" \"{{CLAUDE_HOME}}/hooks/autosave-git.js\"",
+            "timeout": 15
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"{{NODE}}\" \"{{CLAUDE_HOME}}/hooks/guard-irreversible.js\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  },
+  "extraKnownMarketplaces": {
+    "tristan-mods": {
+      "source": {
+        "source": "github",
+        "repo": "tristanmuzzu/claude-mods"
+      }
+    },
+    "remotion": {
+      "source": {
+        "source": "github",
+        "repo": "remotion-dev/claude-code-plugin"
+      }
+    }
+  },
+  "enabledPlugins": {
+    "session-map@tristan-mods": true,
+    "working-dot@tristan-mods": true,
+    "remotion@remotion": true
+  }
+}

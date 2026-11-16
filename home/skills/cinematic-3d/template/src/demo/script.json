@@ -1,0 +1,21 @@
+{
+  "voice": { "am_michael": 0.4, "am_fenrir": 0.6 },
+  "speed": 1.06,
+  "lead": 0.25,
+  "tail": 1.1,
+  "lines": [
+    { "id": "hook", "say": "This isn't footage.", "after": 0.2 },
+    { "id": "blender", "say": "No, it's not Blender.", "after": 0.2 },
+    { "id": "code", "say": "It's code.", "after": 0.1 },
+    { "id": "every", "say": "Every frame of it.", "after": 0.55 },
+    { "id": "ask", "say": "Ask Claude for 3D, you get this.", "after": 0.85 },
+    { "id": "give", "say": "Give Claude my skill, and it thinks like an animator.", "after": 0.3 },
+    { "id": "camera", "say": "Camera.", "after": 0.7 },
+    { "id": "light", "say": "Light.", "after": 0.7 },
+    { "id": "motion", "say": "Motion.", "after": 0.7 },
+    { "id": "sound", "say": "Sound.", "after": 0.6 },
+    { "id": "one", "say": "One skill file.", "after": 0.3 },
+    { "id": "writes", "say": "Claude writes all the code.", "after": 1.5 },
+    { "id": "cta", "say": "Comment skill, and I'll send you the file.", "after": 0 }
+  ]
+}
