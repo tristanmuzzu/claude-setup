@@ -36,6 +36,14 @@ them. Commands run through the PowerShell tool are not checked by the guard.
 denies a short list of destructive ones. The installer only adds entries; it
 never removes yours.
 
+If you chose auto mode, `permissions.defaultMode` is `auto`: a classifier
+approves routine actions and holds back risky ones. `autoMode` in
+`settings.json` tunes it (`$defaults` keeps Anthropic's built-in rules, the
+other lines describe this setup: personal machine, hooks as the backstop,
+what counts as egress). The agent cannot edit those rules itself; change
+them by hand or with the `wizard` skill. `modelSettings` raises the point
+where a long chat is compacted to 400k tokens.
+
 ## Mods and plugins
 
 - `session-map@tristan-mods`: a side pane in the desktop app showing what
@@ -67,6 +75,8 @@ None of the three has a macOS build yet.
 - `verified-deployment`: publish to the right target and prove the live result.
 - `wizard`: a guided bash script for steps only you can do.
 - `cinematic-3d`: cinematic 3D videos in code (Remotion and React Three Fiber).
+- `media-and-motion`: screen recording, `bin/frames.py` contact sheets with a
+  stutter measurement, and headless Blender, Manim and Remotion renders.
 
 ## Updating
 

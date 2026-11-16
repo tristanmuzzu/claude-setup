@@ -59,9 +59,12 @@ message). Offer the default in brackets:
    work, explaining the idea behind it? [yes]
 4. When you ask for a change to one of your own apps or sites that already has
    a live destination, should finishing include publishing it there without
-   asking again? [no, ask each time]
+   asking again? If yes, what is your GitHub user name? [no, ask each time]
 5. Should I commit and push verified work without asking? If yes, which email
    do your commits use? [yes; read `git config --global user.email`]
+6. Should new chats start in auto mode, where a safety check approves routine
+   actions instead of asking you each time? The two safety hooks still stop
+   force-pushes, mass deletes and the like. [yes]
 
 Then build `~/.claude/CLAUDE.md` from `$HOME/claude-setup/home/CLAUDE.template.md`
 and replace every `{{PLACEHOLDER}}`:
@@ -103,13 +106,28 @@ what the kit would add, and merge only what they agree to.
 
 ## 4. Install the core
 
-    node "$HOME/claude-setup/scripts/install.mjs" --dry-run
-    node "$HOME/claude-setup/scripts/install.mjs"
+    node "$HOME/claude-setup/scripts/install.mjs" --dry-run <flags>
+    node "$HOME/claude-setup/scripts/install.mjs" <flags>
 
-This copies the docs, the `reviewer` agent, the two safety hooks, four skills
-and the Blender proxy into `~/.claude`, and merges permissions, hooks and the
+`<flags>` come from the interview: add `--auto-mode` if yes to 6, and
+`--publish-authority=<GitHub user>` if yes to 4. Leave them out otherwise.
+
+This copies the docs, the `reviewer` agent, the two safety hooks, five skills,
+the frames tool and the Blender proxy into `~/.claude`, and merges
+permissions, hooks, the auto-mode rules, the context window setting and the
 mod marketplace into `~/.claude/settings.json`. It backs up anything it
 changes.
+
+Then install the media tools the `media-and-motion` skill uses, unless they
+are already there (`ffmpeg -version`, `magick -version`):
+
+| Windows | macOS |
+|---|---|
+| `winget install --id Gyan.FFmpeg -e` and `winget install --id ImageMagick.ImageMagick -e` | `brew install ffmpeg imagemagick` |
+
+Python 3 is needed for the frames tool (`python --version` on Windows,
+`python3 --version` on macOS); install it the same way if missing
+(`winget install --id Python.Python.3.12 -e`, or `brew install python`).
 
 Claude Code may refuse to let you run this yourself, because changing your own
 permissions and hooks is something its safety check holds back for the

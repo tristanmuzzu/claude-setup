@@ -15,8 +15,8 @@ Windows and macOS:
 > running the verify script and telling me what was installed and what was
 > skipped.
 
-The agent will ask you about five questions (your name, how you like answers,
-whether it may commit and publish without asking). It will hand you a command
+The agent will ask you six short questions (your name, how you like answers,
+whether it may commit and publish without asking, whether to use auto mode). It will hand you a command
 or two to run yourself, because Claude Code rightly does not let an agent
 change its own permissions. At the end, you restart the app once.
 
@@ -28,7 +28,8 @@ change its own permissions. At the end, you restart the app once.
 | `docs/` | Engineering guide (risk-based gates, evidence ladder, limits), subagent routing, notes for the current model. |
 | `reviewer` agent | An independent second lens on a diff, for hard-to-reverse changes. |
 | Safety hooks | `guard-irreversible` stops force-pushes, recursive deletes of real data, disk tools and similar before they run. `autosave-git` snapshots your work before any git command that could lose it. |
-| Skills | `frontend-design`, `verified-deployment`, `wizard`, `cinematic-3d`. |
+| Skills | `frontend-design`, `verified-deployment`, `wizard`, `cinematic-3d`, `media-and-motion` (record the screen and read it back as frames, so motion is judged from evidence). |
+| Auto mode | Optional. A safety check approves routine actions instead of asking every time, tuned with the same rules I use; the hooks stay as a hard backstop. |
 | Mods | `session-map` (a side pane: what Claude is doing, task list, git state) and `working-dot` (a green dot on busy chats), from [claude-mods](https://github.com/tristanmuzzu/claude-mods). Plus Remotion's plugin. |
 | Optional apps | [Parakeet Dictation](https://github.com/tristanmuzzu/parakeet-dictation), [Pipsqueak](https://github.com/tristanmuzzu/Pipsqueak-Agent-Pets), [claude-brainrot](https://github.com/tristanmuzzu/claude-brainrot), and the Blender MCP. |
 
@@ -47,7 +48,8 @@ change its own permissions. At the end, you restart the app once.
 ## Not included, on purpose
 
 - Anything tied to my machine or my work: Linux desktop automation
-  (Deskwright), my machine scripts, work MCP servers, my memory.
+  (Deskwright; Windows and macOS have Claude's built-in computer use
+  instead), my machine scripts, work MCP servers, my memory.
 - No accounts, keys or tokens. You sign in to your own services.
 
 ## Updating
@@ -70,4 +72,5 @@ mods (see step 5 of [AGENT-SETUP.md](AGENT-SETUP.md)).
 ## License
 
 MIT, except `home/skills/frontend-design`, which keeps its own license
-(`LICENSE.txt` in that folder).
+(`LICENSE.txt` in that folder), and `home/bin/frames.py`, taken from
+[Deskwright](https://github.com/tristanmuzzu/deskwright) under Apache-2.0.

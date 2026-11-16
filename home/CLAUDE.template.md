@@ -41,6 +41,14 @@ open a doc when the work enters its territory, not before.
   (date, `file:line`, severity, what, suggested fix, status).
 - Visual changes are verified with a real screenshot before they count as done.
 - Use files {{NAME}} provides exactly as given; never regenerate look-alikes.
+- Make only the change asked for. No drive-by rewrites of nearby code or text.
+- When {{NAME}} picks one of several options, build exactly that one; never a
+  quicker look-alike borrowed from an option they declined.
+- Use the model or version {{NAME}} names. Check what is actually available
+  instead of assuming the newest one you know of.
+- Motion (animations, transitions, scrolling, stutter) is judged from a
+  recording read back as frames, never from a still: use the
+  `media-and-motion` skill.
 
 ## Safety
 

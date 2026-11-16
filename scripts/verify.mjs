@@ -25,7 +25,8 @@ function check(cond, ok, bad, level = fail) { cond ? pass(ok) : level(bad); }
 for (const f of ['docs/engineering.md', 'docs/model-routing.md', 'docs/model-notes.md', 'docs/harness.md',
   'agents/reviewer.md', 'hooks/guard-irreversible.js', 'hooks/autosave-git.js',
   'skills/frontend-design/SKILL.md', 'skills/verified-deployment/SKILL.md',
-  'skills/wizard/SKILL.md', 'skills/cinematic-3d/SKILL.md']) {
+  'skills/wizard/SKILL.md', 'skills/cinematic-3d/SKILL.md', 'skills/media-and-motion/SKILL.md',
+  'bin/frames.py', 'bin/blender-mcp-lazy.py']) {
   check(fs.existsSync(path.join(CH, f)), `${f} present`, `${f} missing: run node scripts/install.mjs`);
 }
 

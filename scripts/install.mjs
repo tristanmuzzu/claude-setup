@@ -4,13 +4,20 @@
 //   node scripts/install.mjs            install or update
 //   node scripts/install.mjs --dry-run  show what would change, write nothing
 //
+// Options from the setup interview (AGENT-SETUP.md step 3):
+//   --auto-mode               start new chats in auto mode (permissions.defaultMode)
+//   --publish-authority=USER  let the auto-mode check allow publishing the
+//                             user's own projects (GitHub account USER) to their
+//                             live destination, and creating private repos there
+//
 // What it does:
 //   - copies home/docs, agents, hooks, skills and bin into ~/.claude
 //   - merges settings/settings.base.json into ~/.claude/settings.json
 //   - backs up every file it would change to ~/.claude/backups/claude-setup-<time>/
 //
 // What it never does: overwrite CLAUDE.md, remove anything you already have,
-// or change a setting you already set. Lists (permissions) are unioned,
+// or change a setting you already set (except permissions.defaultMode when you
+// pass --auto-mode). Lists (permissions, autoMode rules) are unioned,
 // hooks are appended only if the same hook file is not already wired, and
 // plugins and marketplaces are added only when missing.
 //
@@ -22,6 +29,12 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const DRY = process.argv.includes('--dry-run');
+const AUTO = process.argv.includes('--auto-mode');
+const PUBLISH_USER = (process.argv.find(a => a.startsWith('--publish-authority=')) || '').split('=')[1] || '';
+if (PUBLISH_USER && !/^[A-Za-z0-9-]{1,39}$/.test(PUBLISH_USER)) {
+  console.error(`--publish-authority needs a GitHub user name, got "${PUBLISH_USER}".`);
+  process.exit(1);
+}
 const KIT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const CH = path.resolve(process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude'));
 const STAMP = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
@@ -105,6 +118,14 @@ function mergeSettings(cur, base) {
         }
         out.hooks[event] = existing;
       }
+    } else if (k === 'autoMode') {
+      // Union each rule list, so a kit update adds new rules without
+      // dropping any the user wrote.
+      out.autoMode = out.autoMode || {};
+      for (const [ak, av] of Object.entries(v)) out.autoMode[ak] = unionList(out.autoMode[ak], av);
+    } else if (k === 'modelSettings') {
+      out.modelSettings = out.modelSettings || {};
+      for (const [m, mv] of Object.entries(v)) if (!(m in out.modelSettings)) out.modelSettings[m] = mv;
     } else if (k === 'enabledPlugins' || k === 'extraKnownMarketplaces') {
       out[k] = out[k] || {};
       for (const [name, val] of Object.entries(v)) if (!(name in out[k])) out[k][name] = val;
@@ -140,7 +161,18 @@ function main() {
   const baseText = fs.readFileSync(path.join(KIT, 'settings', 'settings.base.json'), 'utf8')
     .replaceAll('{{CLAUDE_HOME}}', CH_FWD)
     .replaceAll('{{NODE}}', NODE);
-  const merged = mergeSettings(cur, JSON.parse(baseText));
+  const base = JSON.parse(baseText);
+  if (AUTO) base.permissions.defaultMode = 'auto';
+  if (PUBLISH_USER) {
+    base.autoMode.environment.push(
+      `Standing publication authority (recorded in ~/.claude/CLAUDE.md): for the user's own apps, sites and tools (repos under github.com/${PUBLISH_USER} and their hosting), deploying or publishing a change they asked for to its established live destination is authorized without a second confirmation, including production aliases. Excluded: employer or client production systems, messages to other people, purchases, and deleting data or accounts.`,
+      `Private repositories: creating a private GitHub repository under ${PUBLISH_USER} for one of the user's own local projects (gh repo create --private) and pushing to it is routine version control, not data sharing. A public repository still needs their explicit ask.`,
+    );
+  }
+  const merged = mergeSettings(cur, base);
+  // The one deliberate override: the person just chose auto mode in the
+  // interview, so it wins over an older defaultMode (backed up first).
+  if (AUTO) merged.permissions.defaultMode = 'auto';
   writeFile(settingsPath, Buffer.from(JSON.stringify(merged, null, 2) + '\n'));
 
   const kitVersion = fs.readFileSync(path.join(KIT, 'VERSION'), 'utf8').trim();
