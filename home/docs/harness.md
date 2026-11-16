@@ -20,15 +20,28 @@ commands down noticeably and never block on their own failure.
       git switch -c rescue <ref>     # or take the snapshot as a branch
 
 - `hooks/guard-irreversible.js`: a parser, not a pattern list. It reads the
-  command the way bash would and blocks or asks before things that cannot be
+  command the way bash or PowerShell would and blocks things that cannot be
   undone or that reach past this machine: recursive deletes of real data,
   force-push, history rewrites, disk and partition tools, publishing gists,
-  piping remote scripts into a shell. It reads the body of a script before
-  that script runs. A fresh autosave snapshot lets it relax the git rules,
-  because the snapshot makes those commands reversible.
+  piping unknown remote scripts into a shell. It reads the body of a script
+  before that script runs. A fresh autosave snapshot lets it relax the git
+  rules, because the snapshot makes those commands reversible.
 
-On Windows, Claude Code runs Bash commands through Git Bash, so both hooks see
-them. Commands run through the PowerShell tool are not checked by the guard.
+  It never asks you to approve a command. Prompts that people approve
+  without reading protect nothing, so a risky command is blocked instead,
+  and the block names the safer route (for a delete, `safe-rm`; for an
+  unknown install script, download and read it first). The agent takes that
+  route itself. Only when nothing safer exists does it tell you the step and
+  the exact command at the end. To get approval prompts back, set the
+  environment variable `GUARD_ALLOW_ASK=1`.
+
+- `bin/safe-rm`: the recoverable delete. `~/.claude/bin/safe-rm <path>` moves
+  the path to `~/.local/share/claude-graveyard` (kept 14 days);
+  `safe-rm --list` shows what is there and `safe-rm --restore <entry>` puts it
+  back. Bash, so it runs in Git Bash on Windows.
+
+The guard checks both the Bash tool (Git Bash on Windows) and the PowerShell
+tool.
 
 ## Permissions
 

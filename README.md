@@ -27,7 +27,7 @@ change its own permissions. At the end, you restart the app once.
 | `CLAUDE.md` rules | How the agent works with you: finish and verify, short plain answers with a TLDR, ask only when it matters, honest about limits. Written for you from a template, then yours to edit. |
 | `docs/` | Engineering guide (risk-based gates, evidence ladder, limits), subagent routing, notes for the current model. |
 | `reviewer` agent | An independent second lens on a diff, for hard-to-reverse changes. |
-| Safety hooks | `guard-irreversible` stops force-pushes, recursive deletes of real data, disk tools and similar before they run. `autosave-git` snapshots your work before any git command that could lose it. |
+| Safety hooks | `guard-irreversible` stops force-pushes, recursive deletes of real data, disk tools and similar before they run, in Bash and PowerShell. It never asks you to approve a command: it blocks and names a safer route, and the agent takes it. `autosave-git` snapshots your work before any git command that could lose it, and `safe-rm` makes deletes recoverable for 14 days. |
 | Skills | `frontend-design`, `verified-deployment`, `wizard`, `cinematic-3d`, `media-and-motion` (record the screen and read it back as frames, so motion is judged from evidence). |
 | Auto mode | Optional. A safety check approves routine actions instead of asking every time, tuned with the same rules I use; the hooks stay as a hard backstop. |
 | Mods | `session-map` (a side pane: what Claude is doing, task list, git state) and `working-dot` (a green dot on busy chats), from [claude-mods](https://github.com/tristanmuzzu/claude-mods). Plus Remotion's plugin. |

@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# Recoverable delete: moves paths into a dated graveyard instead of unlinking.
+#
+# Built for a specific problem: agents run unattended, and nobody can
+# inspect an irreversible action while away. The
+# answer is not a better prompt -- it is removing the irreversibility. A delete
+# you can undo needs no approval.
+#
+#   safe-rm <path> [path...]      # move to the graveyard
+#   safe-rm --list                # what is recoverable, newest first
+#   safe-rm --restore <entry>     # put one back where it came from
+#
+# Retention: entries older than RETENTION_DAYS (default 14) are pruned on each
+# run. Same filesystem as $HOME, so the move is a rename -- instant regardless
+# of size, and it cannot half-copy a 19 GB tree.
+
+set -uo pipefail
+
+GRAVEYARD="${CLAUDE_GRAVEYARD:-$HOME/.local/share/claude-graveyard}"
+RETENTION_DAYS="${CLAUDE_GRAVEYARD_DAYS:-14}"
+
+mkdir -p "$GRAVEYARD"
+
+prune() {
+  find "$GRAVEYARD" -mindepth 1 -maxdepth 1 -type d -mtime "+$RETENTION_DAYS" \
+    -exec rm -rf {} + 2>/dev/null
+}
+
+case "${1:-}" in
+  --list)
+    prune
+    if [ -z "$(ls -A "$GRAVEYARD" 2>/dev/null)" ]; then
+      echo "graveyard empty ($GRAVEYARD)"
+      exit 0
+    fi
+    for d in $(ls -1t "$GRAVEYARD"); do
+      origin="$(cat "$GRAVEYARD/$d/.origin" 2>/dev/null || echo '?')"
+      size="$(du -sh "$GRAVEYARD/$d" 2>/dev/null | cut -f1)"
+      printf '%-28s %6s  %s\n' "$d" "$size" "$origin"
+    done
+    exit 0
+    ;;
+  --restore)
+    entry="${2:-}"
+    [ -z "$entry" ] && { echo "usage: safe-rm --restore <entry>" >&2; exit 1; }
+    src="$GRAVEYARD/$entry"
+    [ -d "$src" ] || { echo "safe-rm: no such entry: $entry" >&2; exit 1; }
+    origin="$(cat "$src/.origin" 2>/dev/null)"
+    [ -z "$origin" ] && { echo "safe-rm: entry has no recorded origin" >&2; exit 1; }
+    [ -e "$origin" ] && { echo "safe-rm: refusing to overwrite existing $origin" >&2; exit 1; }
+    mkdir -p "$(dirname "$origin")"
+    mv "$src/payload" "$origin" && rm -rf "$src"
+    echo "restored: $origin"
+    exit 0
+    ;;
+  ""|-h|--help)
+    echo "usage: safe-rm <path>... | --list | --restore <entry>" >&2
+    echo "  graveyard: $GRAVEYARD (retention ${RETENTION_DAYS}d)" >&2
+    exit 0
+    ;;
+esac
+
+prune
+
+rc=0
+for target in "$@"; do
+  [ -e "$target" ] || { echo "safe-rm: not found: $target" >&2; rc=1; continue; }
+  abs="$(readlink -f -- "$target")" || { echo "safe-rm: cannot resolve: $target" >&2; rc=1; continue; }
+
+  # Refuse the paths where a "recoverable" move is still a disaster.
+  case "$abs" in
+    /|/home|/usr|/usr/*|/etc|/etc/*|/var|/var/*|/boot|/boot/*|/bin|/sbin|/lib*|/opt|/srv|/proc/*|/sys/*|/dev/*|\
+    /System|/System/*|/Library|/Applications|/Users|/private|/private/etc*|\
+    /[a-zA-Z]|/[a-zA-Z]/Users|/[a-zA-Z]/Windows|/[a-zA-Z]/Windows/*|/[a-zA-Z]/Program\ Files*|/[a-zA-Z]/ProgramData*)
+      echo "safe-rm: refusing system path: $abs" >&2; rc=1; continue ;;
+    "$HOME")
+      echo "safe-rm: refusing \$HOME itself" >&2; rc=1; continue ;;
+  esac
+  if [ "$abs" = "$GRAVEYARD" ] || case "$abs" in "$GRAVEYARD"/*) true;; *) false;; esac; then
+    echo "safe-rm: refusing to bury the graveyard" >&2; rc=1; continue
+  fi
+
+  # Claim a slot with plain mkdir, not mkdir -p: mkdir fails when the directory
+  # already exists, and that failure is what keeps two burials apart.
+  #
+  # Earned 2026-09-02. The stamp is second-resolution plus the PID plus the
+  # basename, so burying many paths that share a basename in one invocation
+  # (`safe-rm jobs/*/tmp`) produced ONE slot for all of them. `mkdir -p`
+  # accepted the collision, the second `mv` moved its payload INSIDE the first
+  # one, `.origin` was overwritten with the later path, and the rest failed
+  # outright with a message blaming the filesystem. Two jobs' scratch in one
+  # slot, only one of them named, and --restore would have put back the wrong
+  # tree.
+  base="$(date +%Y%m%d-%H%M%S)-$$-$(basename -- "$abs")"
+  slot=""
+  n=0
+  while [ "$n" -le 999 ]; do
+    cand="$GRAVEYARD/$base"
+    [ "$n" -gt 0 ] && cand="$GRAVEYARD/$base-$n"
+    if mkdir "$cand" 2>/dev/null; then slot="$cand"; break; fi
+    n=$((n + 1))
+  done
+  if [ -z "$slot" ]; then
+    echo "safe-rm: cannot allocate a graveyard slot for $abs. NOT deleted." >&2
+    rc=1; continue
+  fi
+  stamp="$(basename -- "$slot")"
+
+  if err="$(mv -- "$abs" "$slot/payload" 2>&1)"; then
+    printf '%s\n' "$abs" > "$slot/.origin"
+    echo "buried: $abs  ->  safe-rm --restore $stamp"
+  else
+    # Permissions, a busy mount, a cross-device path. Never fall back to
+    # deleting, and say what mv actually said rather than guessing.
+    rmdir "$slot" 2>/dev/null
+    echo "safe-rm: could not move $abs. NOT deleted. ($err)" >&2
+    rc=1
+  fi
+done
+exit "$rc"

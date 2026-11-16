@@ -50,10 +50,73 @@
 'use strict';
 
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
-// HOME is unset for Node on some Windows setups; fall back to the OS home.
-const HOME_DIR = process.env.HOME || require('os').homedir();
+
+// --- platform (Windows port, 2026-11-14) -------------------------------------
+//
+// This file was written on Ubuntu/GNOME and now also runs on Windows 11, where
+// the Bash tool is Git Bash and the PowerShell tool is pwsh 7. It must run under
+// plain `node` (bun is not installed there) and still under bun on Linux.
+//
+// Two rule sets are platform-specific and gated here rather than deleted:
+//   LINUX_RULES   -- desktop/VT/systemd/firewall/journal rules (checkObserverLoss)
+//                    and the cgroup memory-cap stand-down. On Windows none of
+//                    those binaries exist; `wsl <cmd>` re-enables them per segment.
+//   WIN_RULES     -- disk, boot, registry, services, shutdown, event-log rules
+//                    (checkWindowsSystem), the Windows equivalents of the Linux
+//                    tiers, not new policy.
+// GUARD_PLATFORM=linux|win32 forces one set, so the Linux replay suite can be run
+// unchanged on this machine and the Windows table on any machine.
+const IS_WIN = process.platform === 'win32';
+const GUARD_PLATFORM = String(process.env.GUARD_PLATFORM || (IS_WIN ? 'win32' : 'linux')).toLowerCase();
+const LINUX_RULES = GUARD_PLATFORM !== 'win32';
+const WIN_RULES = GUARD_PLATFORM === 'win32';
+// os.homedir() works everywhere; $HOME is unset in a hook spawned by the
+// Windows desktop app, and `process.env.HOME || '/tmp'` silently mis-pointed
+// every home-relative path there.
+const HOME = os.homedir() || process.env.HOME || process.env.USERPROFILE || '';
+
+// Which shell grammar the top-level command is in. Set in main from tool_name.
+let SHELL_MODE = 'bash';
+
+// Lowercased command name with directory, leading `\` and a Windows executable
+// extension removed: `C:\Program Files\Git\cmd\git.exe` and `\rm` are `git` and
+// `rm`. Splits on both separators so it behaves the same on every platform.
+function baseOf(tok) {
+  const s = String(tok || '').split(/[\\/]/).pop().toLowerCase();
+  return s.replace(/\.(exe|cmd|bat|com)$/, '');
+}
+
+// Environment lookup that knows $HOME is not guaranteed on Windows.
+function envLookup(n) {
+  if (process.env[n] !== undefined && process.env[n] !== '') return process.env[n];
+  const u = String(n).toUpperCase();
+  if (u === 'HOME' || u === 'USERPROFILE') return HOME || undefined;
+  if (u === 'TEMP' || u === 'TMP' || u === 'TMPDIR') return os.tmpdir();
+  return undefined;
+}
+
+// A path as the filesystem will see it. Git Bash writes `/c/Users/x` and `~`;
+// node on Windows would resolve `/c/Users/x` to `C:\c\Users\x`, which does not
+// exist -- and "does not exist" is read as "nothing to lose" by the provenance
+// test, so this conversion is load-bearing, not cosmetic.
+function toNative(p) {
+  let s = String(p).replace(/^~(?=[\/\\]|$)/, HOME || '~');
+  if (IS_WIN) {
+    s = s.replace(/^\/(?:cygdrive\/|mnt\/)?([a-zA-Z])(?=\/|$)/, '$1:');
+    if (/^[a-zA-Z]:$/.test(s)) s += '/';
+    s = s.replace(/^\/tmp(?=\/|$)/i, os.tmpdir().replace(/\\/g, '/'));
+  }
+  return s;
+}
+
+function toAbs(p, cwd) {
+  const n = toNative(p);
+  if (path.isAbsolute(n)) return path.resolve(n);
+  return path.resolve(toNative(cwd || process.cwd()), n);
+}
 
 // --- decision log (2026-08-16) ----------------------------------------------
 //
@@ -70,7 +133,7 @@ const HOME_DIR = process.env.HOME || require('os').homedir();
 // id (which the provenance test needs) without writing test rows into the real
 // history. The first run of the logger did exactly that.
 const LOG_PATH = process.env.GUARD_LOG_PATH ||
-  path.join(HOME_DIR, '.claude', 'logs', 'guard-decisions.jsonl');
+  path.join(HOME || os.tmpdir(), '.claude', 'logs', 'guard-decisions.jsonl');
 const LOG_MAX_BYTES = 5 * 1024 * 1024;
 let LOG_CONTEXT = {};
 
@@ -158,6 +221,23 @@ function asVerdict(r) {
   return r;
 }
 
+// Never ask (2026-11-16): the original author approved 55 guard prompts
+// in 10 days without reading them -- 55 prompts in 10 days were approved
+// unread, so ASK protected nothing and cost an interruption each time. What
+// they wanted instead: genuinely dangerous actions are stopped outright and the
+// agent finds another way. So every ASK leaves this hook as a DENY whose text
+// names the safer route, and the agent, not the user, takes it. The tiers stay
+// separate inside the rules (ASK = "a safer route exists", DENY = "never"), so
+// GUARD_ALLOW_ASK=1 restores the old prompts without touching a rule.
+function finalTier(v) {
+  if (v.tier !== 'ask' || process.env.GUARD_ALLOW_ASK === '1') return [v.tier, v.why];
+  const why = v.why.replace(/,? ?(or )?ask the user( for an explicit approval)?( and name what goes in it)?\.?/g, '.')
+    .replace(/\.\./g, '.').replace(/ -- \./g, '.');
+  return ['deny', why + '\n\nBlocked, not sent for approval: the user does not approve commands one at a ' +
+    'time. Take the safer route named above. If nothing safer does the job, finish everything else and ' +
+    'name this one step, with the exact command, in your final reply.'];
+}
+
 // Re-wrap a nested verdict's text while preserving its tier.
 function rewrap(v, prefix, suffix) {
   const n = asVerdict(v);
@@ -200,7 +280,15 @@ function stripHeredocs(cmd) {
 // Split on shell separators that start a NEW command, ignoring any that appear
 // inside quotes. This is what stops `echo "a && rm -rf x"` from being read as
 // two commands.
-function splitSegments(cmd) {
+// PowerShell additions (mode 'powershell'): `<# ... #>` block comments are
+// dropped, a backtick line continuation is joined, and `{` / `}` also start a
+// new command -- `gci | ForEach-Object { Remove-Item $_ -Recurse }` would
+// otherwise read as one command whose head is ForEach-Object. Bash keeps its
+// braces: `find -exec rm {} +` and `${VAR}` must stay intact.
+// keepPipes leaves single `|` in place, for the pipeline-aware checks.
+function splitSegments(cmd, mode, keepPipes) {
+  const ps = (mode || SHELL_MODE) === 'powershell';
+  if (ps) cmd = String(cmd).replace(/<#[\s\S]*?#>/g, ' ').replace(/`\r?\n/g, ' ');
   const out = [];
   let buf = '';
   let quote = null;
@@ -221,11 +309,28 @@ function splitSegments(cmd) {
       out.push(buf); buf = '';
       continue;
     }
-    if (c === ';' || c === '\n' || c === '|' || c === '&') {
+    if (keepPipes && c === '|' && cmd[i + 1] !== '|') { buf += c; continue; }
+    if (c === ';' || c === '\n' || c === '\r' || c === '|' || c === '&' || (ps && (c === '{' || c === '}'))) {
       if ((c === '|' || c === '&') && cmd[i + 1] === c) i++;
       out.push(buf); buf = '';
       continue;
     }
+    buf += c;
+  }
+  out.push(buf);
+  return out.filter((s) => s.trim());
+}
+
+// Split one statement on single `|` outside quotes.
+function splitPipes(stmt) {
+  const out = [];
+  let buf = '';
+  let quote = null;
+  for (let i = 0; i < stmt.length; i++) {
+    const c = stmt[i];
+    if (quote) { if (c === quote) quote = null; buf += c; continue; }
+    if (c === '"' || c === "'") { quote = c; buf += c; continue; }
+    if (c === '|') { out.push(buf); buf = ''; continue; }
     buf += c;
   }
   out.push(buf);
@@ -249,21 +354,27 @@ function tokenise(seg) {
     buf += c;
   }
   push();
-  return toks;
+  // PowerShell accepts an en/em dash as the parameter prefix (`–Recurse`).
+  return toks.map((t) => t.replace(/^[–—―]/, '-'));
 }
 
 // --- classification ---------------------------------------------------------
 
-const RM_NAMES = new Set(['rm', 'rm.exe']);
+const RM_NAMES = new Set(['rm']);
+// Remove-Item and every alias pwsh 7 / cmd ship for it. `rm` is also an alias
+// in PowerShell, which is why the recursive-flag test below accepts both the
+// unix (`-rf`) and the PowerShell (`-Recurse`, `-rec`, `-r`) spellings for all.
 const PS_REMOVE = new Set(['remove-item', 'ri', 'del', 'erase', 'rd', 'rmdir']);
+// cmd.exe builtins whose `/s` switch means "the whole tree".
+const CMD_TREE_DELETE = new Set(['rd', 'rmdir', 'del', 'erase']);
 // Tools that are recursive by definition, so there is no flag to look for.
 // `npx rimraf <repo>` was allowed because the head was `npx` and, once that was
 // unwrapped, because `rimraf` was not a name the guard knew.
 const RECURSIVE_ALWAYS = new Set(['rimraf', 'del-cli', 'trash', 'trash-cli']);
 
 // Wrappers whose real command follows: strip them and re-inspect. `sudo` is
-// recorded rather than silently dropped -- where sudo is passwordless it is not
-// a gate, and several rules
+// recorded rather than silently dropped -- on this machine sudo is passwordless
+// (passwordless sudo), so it is not a gate and several rules
 // below need to know it was present.
 //
 // 2026-08-10 (adversarial replay): the original list was `sudo|command|nohup|
@@ -294,11 +405,12 @@ function skipWrapperFlags(t) {
 function unwrap(toks) {
   // A leading backslash suppresses alias lookup in bash but runs the same
   // binary: `\rm` IS `rm`.
-  let t = toks.slice().map((x, i) => (i === 0 ? String(x).replace(/^\\+/, '') : x));
+  let t = toks.slice().map((x, i) => (i === 0 ? String(x).replace(/^\\+(?=[^\\])/, '') : x));
   let sudo = false;
+  let wsl = false;
   for (let guard = 0; guard < 8 && t.length; guard++) {
-    const head = (t[0] || '').toLowerCase().replace(/^\\+/, '');
-    const base = path.basename(head).toLowerCase();
+    const head = (t[0] || '').toLowerCase().replace(/^\\+(?=[^\\])/, '');
+    const base = baseOf(head);
     if (base === 'sudo' || base === 'doas') {
       sudo = true;
       t = skipWrapperFlags(t.slice(1));
@@ -319,9 +431,28 @@ function unwrap(toks) {
       t = skipWrapperFlags(t.slice(1));
       continue;
     }
-    if (base === 'cmd' || base === 'cmd.exe') {
-      const i = t.findIndex((x) => /^\/[ck]$/i.test(x));
-      if (i >= 0) { t = t.slice(i + 1); continue; }
+    // `cmd /c <command>`; Git Bash users write `cmd //c` to dodge path
+    // conversion. A single quoted payload (`cmd /c "rd /s /q X"`) is re-split.
+    if (base === 'cmd') {
+      const i = t.findIndex((x) => /^\/{1,2}[ck]$/i.test(x));
+      if (i >= 0) {
+        t = t.slice(i + 1);
+        if (t.length === 1 && /\s/.test(t[0])) t = tokenise(t[0]);
+        continue;
+      }
+    }
+    // `wsl [-d distro] [-u user] [--cd dir] [-e|--exec|--] <command>` runs a
+    // Linux command, so the Linux-only rules apply to what follows.
+    if (base === 'wsl') {
+      wsl = true;
+      t = t.slice(1);
+      while (t.length && t[0].startsWith('-')) {
+        if (/^(-e|--exec|--)$/.test(t[0])) { t = t.slice(1); break; }
+        if (/^(-d|--distribution|-u|--user|--cd|--shell-type)$/.test(t[0])) { t = t.slice(2); continue; }
+        t = t.slice(1);
+      }
+      if (t.length === 1 && /\s/.test(t[0])) t = tokenise(t[0]);
+      continue;
     }
     if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(head)) { t = t.slice(1); continue; }
     if (t[0] !== head && !path.isAbsolute(t[0])) t = [head, ...t.slice(1)];
@@ -329,7 +460,13 @@ function unwrap(toks) {
   }
   const out = t.slice();
   out.sudo = sudo;
+  out.wsl = wsl;
   return out;
+}
+
+// Linux-only rules apply on Linux, or to a command run through `wsl`.
+function linuxRulesOn(toks) {
+  return LINUX_RULES || !!(toks && toks.wsl);
 }
 
 // --- commands that carry another command in an argument ---------------------
@@ -339,18 +476,93 @@ function unwrap(toks) {
 // nothing it recognised, and allowed a payload it never looked at.
 const SHELL_DASH_C = /^(bash|sh|zsh|dash|ksh|busybox)$/;
 
+// pwsh/powershell parameters are case-insensitive, accept any unambiguous
+// prefix, and accept `/` as well as `-` on Windows.
+const PS_HOSTS = new Set(['pwsh', 'powershell', 'powershell_ise']);
+const isPsParam = (tok, full, min) => {
+  const m = /^[-/]([A-Za-z]+)$/.exec(String(tok));
+  if (!m) return false;
+  const w = m[1].toLowerCase();
+  return w.length >= min && full.startsWith(w);
+};
+
+// Decode a -EncodedCommand payload (base64 of UTF-16LE). Returns null when the
+// result is not plausibly text, i.e. the guard cannot read it.
+function decodePsEncoded(b64) {
+  try {
+    if (!/^[A-Za-z0-9+/=]+$/.test(b64)) return null;
+    const s = Buffer.from(b64, 'base64').toString('utf16le');
+    if (!s || /[\u0000-\u0008\u000e-\u001f]/.test(s)) return null;
+    return s;
+  } catch { return null; }
+}
+
+// Each entry is { cmd, mode, encoded? }. mode is the grammar of the payload,
+// which is not always the grammar of the outer command (`bash -c` inside a
+// PowerShell call, `pwsh -c` inside Git Bash).
 function nestedCommands(toks) {
   const out = [];
   if (!toks.length) return out;
-  const base = path.basename(String(toks[0])).replace(/^\\+/, '').toLowerCase();
+  const base = baseOf(toks[0]);
 
   if (SHELL_DASH_C.test(base)) {
     for (let i = 1; i < toks.length; i++) {
       if (toks[i] === '-c' || toks[i] === '-lc' || toks[i] === '-cl') {
-        if (toks[i + 1]) out.push(toks[i + 1]);
+        if (toks[i + 1]) out.push({ cmd: toks[i + 1], mode: 'bash' });
         break;
       }
     }
+    return out;
+  }
+
+  // `pwsh -Command <rest...>` runs everything after -Command as one script.
+  // `-EncodedCommand <b64>` hides it; it is decoded and judged, and flagged so
+  // the caller can ASK even when the decoded text is clean.
+  if (PS_HOSTS.has(base)) {
+    for (let i = 1; i < toks.length; i++) {
+      const tk = toks[i];
+      // pwsh documents `-e` and `-ec` as EncodedCommand aliases; `-ex`/`-ep`
+      // are ExecutionPolicy and never match a prefix of "encodedcommand".
+      if (/^[-/](e|ec)$/i.test(tk) || isPsParam(tk, 'encodedcommand', 2)) {
+        const payload = toks[i + 1] || '';
+        out.push({ cmd: decodePsEncoded(payload), mode: 'powershell', encoded: true });
+        return out;
+      }
+      if (isPsParam(tk, 'command', 1)) {
+        const rest = toks.slice(i + 1).join(' ');
+        if (rest.trim() && rest.trim() !== '-') out.push({ cmd: rest, mode: 'powershell' });
+        return out;
+      }
+      if (isPsParam(tk, 'file', 1)) return out; // scriptTargets reads the file
+    }
+    return out;
+  }
+
+  // `Invoke-Expression "<cmd>"` / `iex '<cmd>'` evaluates its string argument.
+  if (base === 'iex' || base === 'invoke-expression') {
+    const args = toks.slice(1).filter((x) => !isPsParam(x, 'command', 1));
+    if (args.length) out.push({ cmd: args.join(' '), mode: 'powershell' });
+    return out;
+  }
+
+  // `Start-Process -FilePath cmd -ArgumentList '/c rd /s /q X'`.
+  if (base === 'start-process' || base === 'saps' || (base === 'start' && SHELL_MODE === 'powershell')) {
+    let file = null;
+    let args = null;
+    const pos = [];
+    for (let i = 1; i < toks.length; i++) {
+      const tk = toks[i];
+      if (isPsParam(tk, 'filepath', 1)) { file = toks[++i]; continue; }
+      if (isPsParam(tk, 'argumentlist', 1) || /^-args$/i.test(tk)) { args = toks[++i]; continue; }
+      if (/^-/.test(tk)) {
+        if (/^-(verb|workingdirectory|wo|windowstyle|win|credential|cred|redirectstandard\w*|rso|rse|rsi)$/i.test(tk)) i++;
+        continue;
+      }
+      pos.push(tk);
+    }
+    if (!file) file = pos.shift();
+    if (args == null && pos.length) args = pos.join(' ');
+    if (file) out.push({ cmd: (file + ' ' + String(args || '').replace(/,/g, ' ')).trim(), mode: 'bash' });
     return out;
   }
 
@@ -360,7 +572,7 @@ function nestedCommands(toks) {
       if (/^-(I|i|n|P|d|a|s|E|L)$/.test(t[0])) { t = t.slice(2); continue; }
       t = t.slice(1);
     }
-    if (t.length) out.push(t.join(' '));
+    if (t.length) out.push({ cmd: t.join(' '), mode: 'bash' });
     return out;
   }
 
@@ -374,7 +586,7 @@ function nestedCommands(toks) {
         const end = toks.findIndex((x, j) => j > i && (x === ';' || x === '+' || x === '\\;'));
         const argv = toks.slice(i + 1, end < 0 ? toks.length : end)
           .map((x) => (x === '{}' ? (findPathArgs(toks)[0] || '{}') : x));
-        if (argv.length) out.push(argv.join(' '));
+        if (argv.length) out.push({ cmd: argv.join(' '), mode: 'bash' });
         i = end < 0 ? toks.length : end;
       }
     }
@@ -410,14 +622,32 @@ function isRecursiveFlag(tok, family) {
     if (low.startsWith('--')) return false;
     return /^-[rfvidI]+$/i.test(tok) && /r/i.test(tok);
   }
-  return /^-r(ec[a-z]*)?$/i.test(low);
+  // Any unambiguous prefix of -Recurse (-r, -re, -rec, ... -Recurse), with an
+  // optional `:$true`. `-Recurse:$false` is explicitly NOT recursive.
+  return /^-r(e(c(u(r(se?)?)?)?)?)?(:\$true)?$/i.test(low);
 }
 
-const PS_VALUE_PARAMS = new Set([
-  '-erroraction', '-warningaction', '-informationaction', '-errorvariable',
-  '-warningvariable', '-outvariable', '-outbuffer', '-pipelinevariable',
-  '-include', '-exclude', '-filter', '-stream',
-]);
+// PowerShell parameters that take a value, so the next token is not a target.
+// Matched by unambiguous prefix (3+ letters) like PowerShell itself does, plus
+// the common-parameter aliases (`-ea 0`, `-ev err`).
+const PS_VALUE_WORDS = [
+  'erroraction', 'warningaction', 'informationaction', 'errorvariable',
+  'warningvariable', 'informationvariable', 'outvariable', 'outbuffer',
+  'pipelinevariable', 'include', 'exclude', 'filter', 'stream', 'credential',
+];
+const PS_VALUE_ALIASES = new Set(['-ea', '-wa', '-infa', '-ev', '-wv', '-iv', '-ov', '-ob', '-pv']);
+const PS_VALUE_PARAMS = {
+  has(low) {
+    if (PS_VALUE_ALIASES.has(low)) return true;
+    const w = low.replace(/^-/, '');
+    return w.length >= 3 && PS_VALUE_WORDS.some((x) => x.startsWith(w));
+  },
+};
+// -Path / -LiteralPath / -PSPath name the target itself.
+function isPsPathParam(low) {
+  const w = low.replace(/^-/, '');
+  return w === 'lp' || w === 'pspath' || (w.length >= 2 && ('path'.startsWith(w) || 'literalpath'.startsWith(w)));
+}
 
 function stripRedirections(toks) {
   const out = [];
@@ -447,17 +677,20 @@ const DISPOSABLE_BASENAMES = new Set([
 // `/\/(scratchpad|\.cache)\//` safe-zone rule and was allowed -- the guard was
 // pattern-matching a string that does not name the directory it deletes.
 function normalise(p) {
-  const slashed = String(p).replace(/\\/g, '/');
+  let slashed = String(p).replace(/\\/g, '/');
+  // Git Bash and Cygwin spell `C:\` as `/c/`; both must hit the same rules.
+  if (IS_WIN) slashed = slashed.replace(/^\/(?:cygdrive\/)?([a-zA-Z])(?=\/|$)/, '$1:');
   const collapsed = path.posix.normalize(slashed);
   return collapsed.replace(/\/+$/, '').toLowerCase() || (slashed.startsWith('/') ? '/' : '');
 }
 
 function disposableRoots() {
   const roots = [];
-  for (const v of [process.env.TEMP, process.env.TMP, process.env.TMPDIR]) {
+  for (const v of [process.env.TEMP, process.env.TMP, process.env.TMPDIR, os.tmpdir()]) {
     if (v) roots.push(normalise(v));
   }
   roots.push('/tmp', 'c:/tmp');
+  if (IS_WIN) roots.push('c:/windows/temp');
   return roots;
 }
 
@@ -475,6 +708,8 @@ function assignmentMap(cmd) {
   const ps = /\$([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:"([^"]*)"|'([^']*)')/g;
   while ((m = ps.exec(cmd)) !== null) {
     map.set(m[1], m[2] !== undefined ? m[2] : (m[3] || ''));
+    // PowerShell variable names are case-insensitive.
+    map.set('ps:' + m[1].toLowerCase(), m[2] !== undefined ? m[2] : (m[3] || ''));
   }
   return map;
 }
@@ -483,13 +718,18 @@ function expandTarget(target, map) {
   let out = String(target);
   for (let i = 0; i < 4; i++) {
     const next = out
-      .replace(/\$env:([A-Za-z_][A-Za-z0-9_]*)/gi, (w, n) => process.env[n.toUpperCase()] || w)
+      .replace(/\$\{?env:([A-Za-z_][A-Za-z0-9_]*)\}?/gi, (w, n) => envLookup(n) || w)
+      .replace(/%([A-Za-z_][A-Za-z0-9_]*)%/g, (w, n) => envLookup(n) || w)
       .replace(/\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/g, (w, n) => {
         if (map && map.has(n)) return map.get(n);
-        if (process.env[n]) return process.env[n];
+        if (map && map.has('ps:' + n.toLowerCase())) return map.get('ps:' + n.toLowerCase());
+        // `$_` is PowerShell's pipeline item, not the environment's `_`.
+        if (n === '_') return w;
+        const e = envLookup(n);
+        if (e) return e;
         return w;
       })
-      .replace(/^~(?=\/|$)/, HOME_DIR);
+      .replace(/^~(?=[\/\\]|$)/, HOME || '~');
     if (next === out) break;
     out = next;
   }
@@ -524,7 +764,7 @@ const CLOCK_SLACK_MS = 0;
 let SESSION_START_MS = null; // set in main; null means "unknown, keep asking"
 
 function readSessionStart(payload) {
-  const home = HOME_DIR;
+  const home = HOME;
   const candidates = [];
   if (payload && payload.session_id) {
     candidates.push(path.join(home, '.claude', 'session-env', String(payload.session_id)));
@@ -581,12 +821,17 @@ function bornThisSession(abs) {
 function isAgentCreated(abs, cwd) {
   if (SESSION_START_MS === null) return false;
   if (!abs || !path.isAbsolute(abs)) return false;
+  // A variable the guard could not resolve (`$d` from a loop, `$_` in a
+  // pipeline, `%X%`) names an unknown path. Resolving it literally produced a
+  // path that does not exist, which the "nothing there" branch below then
+  // allowed -- an unknowable target read as an empty one. Unknown means ask.
+  if (/\$|`|%[A-Za-z_][A-Za-z0-9_]*%/.test(abs)) return false;
   const n = normalise(abs);
-  if (!n || n === '/' || n === '~') return false;
+  if (!n || n === '/' || n === '~' || /^[a-z]:$/.test(n)) return false;
   // The standing exclusions hold regardless of when the path was created.
   if (/\.worktrees?\//.test(n) || /\/\.git$/.test(n)) return false;
   if (/\/\.claude(\/|$)/.test(n) || /\/\.codex(\/|$)/.test(n)) return false;
-  const home = normalise(HOME_DIR);
+  const home = normalise(HOME || '/home/nobody');
   if (n === home) return false;
 
   // Condition 2: inside the session's own working tree, or a disposable root.
@@ -610,13 +855,39 @@ function isAgentCreated(abs, cwd) {
   return !gitTracks(abs);
 }
 
+// A RELATIVE path that runs through a build-output directory (`../out/siren/$S`,
+// `dist/assets`) is regenerable even when its last part is a variable: render
+// and build scripts clear their own output this way, and that was gated as
+// one-way. Relative only, so an absolute `C:\x\out\...` is still judged on
+// its own merits.
+function insideBuildOutput(raw) {
+  const s = String(raw).replace(/\\/g, '/');
+  if (s.startsWith('/') || s.startsWith('~') || /^[A-Za-z]:/.test(s)) return false;
+  const parts = s.split('/');
+  for (let i = 0; i < parts.length - 1; i++) {
+    const p = parts[i];
+    if (/[$%`]/.test(p)) return false;
+    if (p !== 'node_modules' && DISPOSABLE_BASENAMES.has(p.toLowerCase())) return true;
+  }
+  return false;
+}
+
+// rsync/scp remote spec: `host:path`, `user@host:path`, `$HOST:$DIR`, `host::module`.
+// A colon before any slash means remote; `C:\x` and `C:/x` are Windows drives.
+function isRemoteSpec(p) {
+  const s = String(p || '');
+  if (/^[A-Za-z]:[\\/]/.test(s)) return false;
+  return /::/.test(s) || /^[^/\\]+:/.test(s);
+}
+
 function isDisposableTarget(raw) {
   if (!raw) return false;
+  if (insideBuildOutput(raw)) return true;
   if (/[$%]/.test(raw) && !/^%temp%/i.test(raw) && !/^\$env:temp/i.test(raw)) {
     if (!/temp|tmp|scratch/i.test(raw)) return false;
   }
   const n = normalise(raw);
-  if (!n || n === '/' || n === '.' || n === '..' || n === '~') return false;
+  if (!n || n === '/' || n === '.' || n === '..' || n === '~' || /^[a-z]:$/.test(n)) return false;
 
   // Never disposable: a git worktree checkout (guide rule, incident 2026-06-15
   // -- use `git worktree remove`), or the agent's own state and transcripts.
@@ -631,7 +902,7 @@ function isDisposableTarget(raw) {
   // CARGO_TARGET_DIR override, and were prompting for the same wrong reason.
   if (/^target(-[\w.]+)?$/.test(base)) {
     try {
-      if (!fs.existsSync(path.join(path.dirname(n), 'Cargo.toml'))) return false;
+      if (!fs.existsSync(path.join(path.dirname(toNative(n)), 'Cargo.toml'))) return false;
     } catch { return false; }
     return true;
   }
@@ -677,7 +948,10 @@ function isVtSwitch(seg) {
 }
 
 function checkObserverLoss(toks, seg) {
-  const base = path.basename((toks[0] || '')).toLowerCase();
+  // Everything below names Linux desktop/systemd/netfilter binaries. On Windows
+  // they do not exist; the Windows equivalents live in checkWindowsSystem.
+  if (!linuxRulesOn(toks)) return null;
+  const base = baseOf(toks[0]);
   const rest = toks.slice(1).map((t) => t.toLowerCase());
   const all = rest.join(' ');
 
@@ -706,7 +980,9 @@ function checkObserverLoss(toks, seg) {
       return 'Stopping or masking the display manager or the network stack ends this session or cuts the ' +
         'connection, so nothing after it can be verified. Blocked (Q3). Ask the user if it is genuinely needed.';
     }
-    if (verb === 'isolate' && /\b(rescue|emergency|multi-user)/.test(target)) {
+    // Was `.test(target)` -- an undefined name, so this branch threw a
+    // ReferenceError and only the fail-closed catch in main saved it.
+    if (verb === 'isolate' && /\b(rescue|emergency|multi-user)/.test(all)) {
       return '`systemctl isolate` to a non-graphical target tears down the desktop session. Blocked (Q3).';
     }
   }
@@ -745,7 +1021,9 @@ function checkObserverLoss(toks, seg) {
 
 // Self-privilege: changing the rules the agent runs under, through the shell
 // (the Edit/Write channel stays with the classifier, which judges intent).
-const SELF_PRIVILEGE_PATHS = /(^|\/)\.claude\/(settings\.json|settings\.local\.json|hooks\/|CLAUDE\.md)|(^|\/)\.claude\.json$/;
+// Case-insensitive since the Windows port: NTFS treats `.Claude\Settings.json`
+// as the same file.
+const SELF_PRIVILEGE_PATHS = /(^|\/)\.claude\/(settings\.json|settings\.local\.json|hooks\/|CLAUDE\.md)|(^|\/)\.claude\.json$/i;
 // Split by mutator class, not by path. H-105 (2026-08-11): in auto mode a hook
 // ASK verdict is adjudicated by the classifier, not by the user -- and the
 // classifier approved `python3 -c "...json.dump(settings.json)"` while refusing
@@ -760,25 +1038,60 @@ const SELF_PRIVILEGE_PATHS = /(^|\/)\.claude\/(settings\.json|settings\.local\.j
 const HARD_MUTATORS = new Set([
   'sed', 'tee', 'dd', 'truncate', 'python', 'python3', 'node', 'perl', 'jq',
   'sponge', 'patch',
+  // PowerShell content writers (Windows port). `tee` above is Tee-Object there.
+  'set-content', 'add-content', 'out-file', 'clear-content', 'ac', 'tee-object',
 ]);
 // SOFT moves a whole file that already exists somewhere reviewable. A
 // reasonable answer is routinely yes -- `cp settings.json.bak-x settings.json`
 // restores a backup and INCREASES safety, and copying a reviewed hook into
 // `~/.claude/hooks/` is how a deploy works. Stays on ASK.
-const SOFT_MUTATORS = new Set(['install', 'mv', 'cp', 'ln', 'chmod', 'chown']);
+const SOFT_MUTATORS = new Set([
+  'install', 'mv', 'cp', 'ln', 'chmod', 'chown',
+  // PowerShell/cmd whole-file movers and ACL tools (Windows port).
+  'copy-item', 'cpi', 'copy', 'move-item', 'mi', 'move', 'rename-item', 'ren', 'rni',
+  'new-item', 'ni', 'icacls', 'takeown', 'xcopy', 'robocopy',
+  // Deleting the guard or settings.json is as much a rule change as rewriting
+  // it, and recursive-only coverage left `rm ~/.claude/hooks/guard-irreversible.js`
+  // ungated on both platforms.
+  'rm', 'remove-item', 'ri', 'del', 'erase', 'unlink',
+]);
+const PS_COPY_MOVE = new Set(['copy-item', 'cpi', 'copy', 'move-item', 'mi', 'move', 'xcopy']);
 // The canonical source tree the harness is deployed FROM. Anchored on the
 // `managed/claude/` segment rather than an absolute path so a checkout in
 // another directory still matches.
 const MANAGED_SOURCE = /(^|\/)managed\/claude\//;
 const MUTATORS = new Set([...HARD_MUTATORS, ...SOFT_MUTATORS]);
 
+function selfPrivilegeWhy() {
+  return 'This rewrites the agent\'s own permissions, hooks or guide through the shell -- a ' +
+    'self-privilege change (Q3), and it is the one mistake that compounds: every later action runs ' +
+    'under the rules it just changed. ';
+}
+
 function checkSelfPrivilege(toks, seg) {
-  const base = path.basename((toks[0] || '')).toLowerCase();
+  const base = baseOf(toks[0]);
+  const slashedSeg = seg.replace(/\\/g, '/');
+  if (!SELF_PRIVILEGE_PATHS.test(slashedSeg)) return null;
+  // A shell redirection over the file (`echo {} > ~/.claude/settings.json`,
+  // PowerShell `*>`) is the same in-place rewrite as `tee`, whatever the head.
+  for (let i = 0; i < toks.length; i++) {
+    const m = /^(?:\d|\*)?>>?(.*)$/.exec(toks[i]);
+    if (!m) continue;
+    const dest = m[1] || toks[i + 1] || '';
+    if (SELF_PRIVILEGE_PATHS.test(dest.replace(/\\/g, '/'))) {
+      return DENY(selfPrivilegeWhy() + 'Rewriting a config file in place by redirection is never the right tool. ' +
+        'Use the Edit or Write tool, where the diff is visible before it lands.');
+    }
+  }
+  // .NET file APIs from PowerShell: `[IO.File]::WriteAllText('...settings.json', ...)`.
+  if (/\[(system\.)?io\.file\]::(write|append|delete|copy|move|replace|create)/i.test(seg)) {
+    return DENY(selfPrivilegeWhy() + 'Rewriting a config file from a .NET one-liner is never the right tool. ' +
+      'Use the Edit or Write tool, where the diff is visible before it lands.');
+  }
   if (!MUTATORS.has(base)) return null;
-  if (!SELF_PRIVILEGE_PATHS.test(seg.replace(/\\/g, '/'))) return null;
   // Hook scripts used to be excluded here: a terminal block would have wedged
   // ordinary work on the user's own hook projects (7 such commands in the corpus,
-  // all legitimate). With the ASK tier that reasoning no longer holds -- he sees
+  // all legitimate). With the ASK tier that reasoning no longer holds -- they see
   // the reason and approves -- so `~/.claude/hooks/` is now gated too. This is
   // the layer that matters most while the bwrap sandbox stays off: without it,
   // nothing else stops a shell command from rewriting the guard that is
@@ -793,7 +1106,7 @@ function checkSelfPrivilege(toks, seg) {
   if (base === 'jq' && !/>\s*\S*settings(\.local)?\.json|\.claude\.json\s*$|\bsponge\b/.test(seg)) return null;
   if ((base === 'python' || base === 'python3' || base === 'node' || base === 'perl') &&
       !/\bopen\s*\([^)]*['"][wa]|writeFileSync|writeFile/.test(seg)) return null;
-  if (base === 'cp' || base === 'mv' || base === 'install') {
+  if (base === 'cp' || base === 'mv' || base === 'install' || PS_COPY_MOVE.has(base)) {
     // Copying settings OUT to a backup is not a privilege change.
     const rest = stripRedirections(toks.slice(1)).filter((t) => !t.startsWith('-'));
     const dest = rest[rest.length - 1] || '';
@@ -805,9 +1118,7 @@ function checkSelfPrivilege(toks, seg) {
     // self-privilege prompts in the 2026-08-16 review came from.
     if (rest.slice(0, -1).some((s) => MANAGED_SOURCE.test(s.replace(/\\/g, '/')))) return null;
   }
-  const why = 'This rewrites the agent\'s own permissions, hooks or guide through the shell -- a ' +
-    'self-privilege change (Q3), and it is the one mistake that compounds: every later action runs ' +
-    'under the rules it just changed. ';
+  const why = selfPrivilegeWhy();
   if (HARD_MUTATORS.has(base)) {
     return DENY(why + 'Rewriting a config file in place from a one-liner is never the right tool. ' +
       'Use the Edit or Write tool, where the diff is visible before it lands.');
@@ -818,15 +1129,28 @@ function checkSelfPrivilege(toks, seg) {
 
 // --- Q1: loss of something that cannot be regenerated -----------------------
 
+// Directories a recursive ownership/ACL sweep must never cover. Normalised
+// (lowercase, forward slashes, `/c/` -> `c:/` on Windows) before the test.
+function isSystemRoot(n) {
+  if (n === '/' || n === '~' || n === '/home' || /^\/(etc|usr|var|boot|opt|srv)(\/|$)/.test(n) ||
+      /^\/home\/[^/]+$/.test(n)) return true;
+  if (/^[a-z]:\/?$/.test(n)) return true;
+  if (/^[a-z]:\/(windows|program files|program files \(x86\)|programdata|recovery|boot)(\/|$)/.test(n)) return true;
+  if (/^[a-z]:\/users(\/[^/]+)?$/.test(n)) return true;
+  return !!HOME && n === normalise(HOME);
+}
+
 function checkUnrecoverable(toks, seg) {
-  const base = path.basename((toks[0] || '')).toLowerCase();
+  const base = baseOf(toks[0]);
   const rest = toks.slice(1).map((t) => t.toLowerCase());
   const all = rest.join(' ');
 
   if (base === 'mkfs' || /^mkfs\./.test(base) || base === 'wipefs' || base === 'shred') {
     return '`' + base + '` destroys a filesystem or a file beyond recovery. Blocked (Q1) -- ask the user.';
   }
-  if (base === 'dd' && /\bof=\/dev\//.test(all)) {
+  // Git Bash maps /dev/sdX to physical disks; `\\.\PhysicalDrive0` is the
+  // native spelling of the same thing.
+  if (base === 'dd' && /\bof=(\/dev\/|\\\\\.\\|\/\/\.\/)/.test(all)) {
     return '`dd` writing to a block device overwrites the disk. Blocked (Q1) -- ask the user.';
   }
   if ((base === 'parted' || base === 'fdisk' || base === 'sfdisk' || base === 'sgdisk') &&
@@ -869,8 +1193,7 @@ function checkUnrecoverable(toks, seg) {
     const bad = targets.filter((t) => {
       // normalise() strips trailing slashes, which turns "/" into "".
       const n = normalise(t) || '/';
-      return n === '/' || n === '~' || n === '/home' || /^\/(etc|usr|var|boot|opt|srv)(\/|$)/.test(n) ||
-        /^\/home\/[^/]+$/.test(n);
+      return isSystemRoot(n);
     });
     if (bad.length) {
       return 'Recursive ownership or permission changes over ' + bad.map((t) => '`' + t + '`').join(', ') +
@@ -895,26 +1218,60 @@ const CREDENTIAL_FILE = /(^|[\/\\.])(\.env(\.|$|["'\s])|credentials?\.json|\.pem
 // as ASK: a command that would print the contents of one of those stores.
 // Listing, permission changes and the tools that legitimately consume the
 // store (ssh, kubectl, git, gpg, aws, az) pass; only reading the VALUE asks.
-const CREDENTIAL_STORE = /(~|\$HOME|\$\{HOME\}|\/home\/[^/\s"']+|\/root)\/(\.ssh\/|\.aws\/|\.gnupg\/|\.kube\/config(\b|$)|\.claude\/\.credentials\.json(\b|$))/;
+// Tested against the segment with backslashes turned into slashes. The Windows
+// home spellings (`C:\Users\x`, `/c/Users/x`, `$env:USERPROFILE`, `%USERPROFILE%`)
+// were added in the Windows port; PowerShell's `$HOME` is case-insensitive.
+const CREDENTIAL_STORE = /(~|\$HOME|\$\{HOME\}|\$env:(USERPROFILE|HOME)|\$\{env:(USERPROFILE|HOME)\}|%USERPROFILE%|%HOMEDRIVE%%HOMEPATH%|\/home\/[^/\s"']+|\/root|(?:\b[a-z]:|\/[a-z]|\/cygdrive\/[a-z])\/users\/[^/\s"']+)\/(\.ssh\/|\.aws\/|\.gnupg\/|\.kube\/config(\b|$)|\.claude\/\.credentials\.json(\b|$))/i;
 const STORE_CONSUMERS = new Set([
   'ls', 'stat', 'file', 'test', '[', 'chmod', 'chown', 'mkdir', 'touch', 'du', 'find', 'tree',
   'ssh', 'ssh-add', 'ssh-keygen', 'ssh-copy-id', 'ssh-agent', 'sftp', 'gpg', 'gpg2', 'gpgconf',
   'kubectl', 'helm', 'k9s', 'az', 'aws', 'git', 'rsync', 'scp',
+  // PowerShell / Windows equivalents of listing, metadata and ACL fixes.
+  'get-childitem', 'gci', 'dir', 'test-path', 'get-item', 'gi', 'get-acl', 'set-acl', 'icacls',
+  'new-item', 'ni', 'resolve-path', 'rvpa', 'split-path', 'join-path',
 ]);
 
+// Commands that only handle the PATH string, never the file's contents.
+const PATH_ONLY = new Set(['for', 'echo', 'printf', 'realpath', 'readlink', 'basename', 'dirname', '[[', 'write-output', 'write-host']);
+// Files in those stores that hold no secret: a public key is meant to be
+// shared (5 prompts in 10 days were `cat ~/.ssh/id_ed25519.pub` in a setup
+// script that prints it for pasting into a server panel).
+const NOT_SECRET = /\.pub\b|\/known_hosts\b|\.ssh\/config\b/;
+
 function checkCredentialRead(toks, seg) {
-  if (!CREDENTIAL_STORE.test(seg)) return null;
-  const base = path.basename((toks[0] || '')).toLowerCase();
-  if (STORE_CONSUMERS.has(base)) return null;
+  const fseg = seg.replace(/\\/g, '/');
+  if (!CREDENTIAL_STORE.test(fseg)) return null;
+  const base = baseOf(toks[0]);
+  if (STORE_CONSUMERS.has(base) || PATH_ONLY.has(base)) return null;
+  // Key tools called through a helper (`run_cmd "Create a key" ssh-keygen ...`)
+  // write or use the key; they never print the private half.
+  if (toks.slice(1).some((t) => /^(ssh-keygen|ssh-add|ssh-copy-id)(\.exe)?$/.test(baseOf(t)))) return null;
+  const hits = fseg.match(new RegExp(CREDENTIAL_STORE.source + '[^\\s"\')]*', 'g')) || [];
+  if (hits.length && hits.every((h) => NOT_SECRET.test(h))) return null;
   return 'Reading a credential store (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.kube/config`, ' +
     '`~/.claude/.credentials.json`) prints a secret VALUE into the transcript, which is egress once ' +
-    'the transcript syncs. Blocked (Q2) -- ask the user. Listing the directory or using the key ' +
-    'through ssh/kubectl/gpg is fine and passes without asking.';
+    'the transcript syncs. Blocked (Q2). Check existence with `test -f`, `ls` or `Test-Path`, or use ' +
+    'the key through ssh/kubectl/gpg; those pass without a block.';
 }
 
+const PS_WEB = new Set(['iwr', 'irm', 'invoke-webrequest', 'invoke-restmethod']);
+
 function checkEgress(toks, seg) {
-  const base = path.basename((toks[0] || '')).toLowerCase();
+  const base = baseOf(toks[0]);
   const all = toks.slice(1).join(' ');
+
+  // PowerShell's HTTP cmdlets: same two tiers as curl.
+  if (PS_WEB.has(base)) {
+    if (PASTE_HOSTS.test(seg)) {
+      return 'Uploading to a public paste or file-drop service sends local data somewhere it cannot be ' +
+        'recalled. Blocked (Q2) -- if this is deliberate, the user should name the destination.';
+    }
+    const upload = /(^|\s)-(inf(i(le?)?)?|bo(dy?)?|fo(rm?)?)(\s|:|$)/i.test(' ' + all);
+    if (upload && CREDENTIAL_FILE.test(all)) {
+      return DENY('Uploading a credential file to a remote host. Blocked (Q2) -- a leaked secret cannot be unsent, ' +
+        'only rotated.');
+    }
+  }
 
   if (base === 'curl' || base === 'wget') {
     if (PASTE_HOSTS.test(seg)) {
@@ -943,15 +1300,92 @@ function checkPipeToShell(rawCmd) {
   // it runs LOCAL code with the download as stdin data, which is ordinary work
   // and accounted for 4 of the corpus false positives. The dangerous form is an
   // interpreter with no inline script of its own.
-  const re = /\b(curl|wget|iwr|invoke-webrequest)\b[^|;\n]{0,400}\|\s*(sudo\s+)?(bash|sh|zsh|dash|ksh|python3?|node|perl|ruby|pwsh)\b([^|;\n]*)/i;
-  const m = re.exec(rawCmd);
-  if (m && !/(^|\s)(-c|-e|--eval|--command)(\s|$)/.test(m[4] || '')) {
+  const re = /\b(curl|wget|iwr|irm|invoke-webrequest|invoke-restmethod)\b([^|;\n]{0,400})\|\s*(sudo\s+)?(bash|sh|zsh|dash|ksh|python3?|node|perl|ruby|pwsh|powershell)(\.exe)?\b([^|;\n]*)/i;
+  // Pipes inside quotes are text, not pipes: `grep -E "curl|wget|sh"` read as
+  // curl piped into sh. Mask them (same length) before matching.
+  const masked = maskQuotedPipes(rawCmd);
+  const m = re.exec(masked);
+  if (m && !/(^|\s)(-c|-e|--eval|--command)(\s|$)/.test(m[6] || '') && !allOfficial(m[2])) {
     return 'Piping a download straight into a shell runs code nobody has read, from a source this session ' +
       'has not verified. Blocked (Q2). Download to the scratchpad, read it, then run it.';
   }
-  if (/\bpip3?\s+install\b[^\n;]*\b(git\+|https?:\/\/)/i.test(rawCmd)) {
-    return 'Installing a Python package straight from a URL or git ref executes arbitrary setup code from an ' +
-      'unpinned source. Blocked (Q2) -- ask the user, or pin it in the project\'s requirements.';
+  // The PowerShell spellings of the same thing: `iwr URL | iex`,
+  // `iex (irm URL)`, `iex ((New-Object Net.WebClient).DownloadString(URL))`,
+  // `& ([scriptblock]::Create((irm URL)))`.
+  const DL = '(curl|wget|iwr|irm|invoke-webrequest|invoke-restmethod|downloadstring|downloaddata|downloadfile|net\\.webclient|start-bitstransfer)';
+  const psm = new RegExp('\\b' + DL + '\\b[^;\\n]{0,400}\\|\\s*(iex|invoke-expression)\\b', 'i').exec(masked) ||
+      new RegExp('\\b(iex|invoke-expression)\\b[^;\\n]{0,400}\\b' + DL + '\\b[^;\\n]{0,400}', 'i').exec(masked) ||
+      new RegExp('\\[scriptblock\\]::create\\s*\\([^;\\n]{0,400}\\b' + DL + '\\b[^;\\n]{0,400}', 'i').exec(masked);
+  if (psm && !allOfficial(psm[0])) {
+    return 'Evaluating downloaded text with Invoke-Expression runs code nobody has read, from a source this ' +
+      'session has not verified. Blocked (Q2). Download to the scratchpad, read it, then run it.';
+  }
+  const pip = checkPipUrlInstall(rawCmd);
+  if (pip) return pip;
+  return null;
+}
+
+function maskQuotedPipes(s) {
+  let out = '';
+  let q = null;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (q) {
+      if (ch === q && s[i - 1] !== '\\' && s[i - 1] !== '`') q = null;
+      out += (ch === '|' || ch === ';' || ch === '\n') ? ' ' : ch;
+    } else {
+      if (ch === '"' || ch === "'") q = ch;
+      out += ch;
+    }
+  }
+  return out;
+}
+
+// Vendor install scripts, matched on the URL prefix (https only). A vendor's
+// own documented installer is what its docs tell a human to paste; gating it
+// bought nothing, since every one in the log was approved unread.
+const OFFICIAL_INSTALLERS = [
+  'https://claude.ai/install', 'https://astral.sh/', 'https://bun.sh/install', 'https://sh.rustup.rs',
+  'https://win.rustup.rs/', 'https://get.pnpm.io/', 'https://deno.land/install', 'https://fnm.vercel.app/install',
+  'https://raw.githubusercontent.com/nvm-sh/nvm/', 'https://raw.githubusercontent.com/Homebrew/install/',
+  'https://get.docker.com', 'https://ollama.com/install', 'https://install.python-poetry.org',
+  'https://deb.nodesource.com/', 'https://rpm.nodesource.com/', 'https://starship.rs/install',
+  'https://tailscale.com/install', 'https://cli.github.com/', 'https://get.volta.sh',
+  'https://opencode.ai/install', 'https://mise.run', 'https://pixi.sh/install', 'https://get.scoop.sh',
+  'https://community.chocolatey.org/install.ps1', 'https://aka.ms/install-powershell.ps1',
+];
+function allOfficial(text) {
+  const urls = String(text || '').match(/https:\/\/[^\s'"|)]+/g) || [];
+  return urls.length > 0 && urls.every((u) => OFFICIAL_INSTALLERS.some((p) => u.startsWith(p)));
+}
+
+// `pip install <url>` runs setup code from wherever the URL points. Only the
+// PACKAGE arguments count: `--index-url https://download.pytorch.org/...` is a
+// package index, not a package, and was gated 3 times in 10 days for nothing.
+// A git ref pinned to a tag or commit, or a versioned release archive, is
+// reproducible, which is what the rule was protecting.
+function checkPipUrlInstall(rawCmd) {
+  const re = /\bpip3?\s+install\b([^\n;&|]*)/gi;
+  let m;
+  while ((m = re.exec(rawCmd))) {
+    const toks = m[1].trim().split(/\s+/);
+    const pkgs = [];
+    for (let i = 0; i < toks.length; i++) {
+      const t = toks[i].replace(/^['"]|['"]$/g, '');
+      if (/^(-i|--index-url|--extra-index-url|-f|--find-links|--trusted-host|-c|--constraint|-r|--requirement|--python|-t|--target|--prefix)$/.test(t)) { i++; continue; }
+      if (t.startsWith('-')) continue;
+      pkgs.push(t);
+    }
+    for (const p of pkgs) {
+      const url = (p.match(/(git\+\S+|https?:\/\/\S+)/) || [])[1];
+      if (!url) continue;
+      const pinnedGit = /^git\+/.test(url) && /@(v?\d[\w.-]*|[0-9a-f]{7,40})(#|$)/.test(url);
+      const releaseFile = /^https:\/\//.test(url) && /[-_]v?\d+(\.\d+)+[^/]*\.(whl|tar\.gz|zip)(#.*)?$/.test(url);
+      if (!pinnedGit && !releaseFile) {
+        return 'Installing a Python package from an unpinned URL or git ref runs setup code that can change ' +
+          'under you. Blocked (Q2) -- pin it: `git+<url>@<tag or commit>`, or a versioned release archive.';
+      }
+    }
   }
   return null;
 }
@@ -989,7 +1423,7 @@ let AUTOSAVE = null; // set once in main, read by checkGitHistory
 
 function freshAutosave(cwd) {
   try {
-    const base = process.env.XDG_RUNTIME_DIR || path.join(require('os').tmpdir(), `claude-${process.getuid ? process.getuid() : 0}`);
+    const base = process.env.XDG_RUNTIME_DIR || path.join(os.tmpdir(), `claude-${process.getuid ? process.getuid() : 0}`);
     const dir = path.join(base, 'claude-autosave');
     // The marker is keyed by repo root, which the hook resolved. Match any
     // marker whose repo is a prefix of cwd, so a subdirectory still counts.
@@ -1007,7 +1441,7 @@ function freshAutosave(cwd) {
 }
 
 function checkGitHistory(toks) {
-  const head = path.basename(String(toks[0] || '')).replace(/^\\+/, '').toLowerCase();
+  const head = baseOf(toks[0]);
   if (head !== 'git') return null;
   const after = stripGitGlobals(toks);
   const sub = (after[0] || '').toLowerCase();
@@ -1057,7 +1491,7 @@ function checkGitHistory(toks) {
 // right. Returns null when the segment is not a recursive delete.
 function recursiveDeleteTargets(toks) {
   const head = (toks[0] || '');
-  const base = path.basename(head).toLowerCase();
+  const base = baseOf(head);
   if (base === 'git') return null; // `git rm` is an index operation
 
   const isRm = RM_NAMES.has(base);
@@ -1065,19 +1499,32 @@ function recursiveDeleteTargets(toks) {
   const isAlways = RECURSIVE_ALWAYS.has(base);
   if (!isRm && !isPs && !isAlways) return null;
 
-  const family = isRm || isAlways ? 'unix' : 'powershell';
   const args = stripRedirections(toks.slice(1));
 
-  const cmdStyleRecursive = (base === 'rmdir' || base === 'rd') && args.some((a) => /^\/s$/i.test(a));
-  const recursive = isAlways || args.some((a) => isRecursiveFlag(a, family)) || cmdStyleRecursive;
+  // `rm` is GNU rm in Git Bash and Remove-Item in PowerShell, and `ri`/`del`
+  // accept `-r`, so every delete head is tested against BOTH flag spellings.
+  // A unix-only test read `rm -Recurse X` (valid PowerShell) as non-recursive.
+  // cmd.exe's `rd /s` and `del /s` are tree deletes; Git Bash writes `//s`.
+  const isCmdish = CMD_TREE_DELETE.has(base);
+  const cmdStyleRecursive = isCmdish && args.some((a) => /^\/{1,2}s$/i.test(a));
+  const recursive = isAlways || cmdStyleRecursive ||
+    args.some((a) => isRecursiveFlag(a, 'unix') || (!isAlways && isRecursiveFlag(a, 'powershell')));
   if (!recursive) return null;
 
-  const isCmdSwitch = (a) => /^\/[a-z]$/i.test(a);
+  // Only cmd-style heads take `/x` switches; for `rm` a `/c` is the C: drive in
+  // Git Bash and must stay a target.
+  const isCmdSwitch = (a) => isCmdish && /^\/{1,2}[a-z](:\S*)?$/i.test(a);
   const targets = [];
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     const low = a.toLowerCase().replace(/:.*$/, '');
     if (a.startsWith('-')) {
+      // `-Path:C:\x` / `-LiteralPath:'C:\x'` carry the target inside the flag.
+      if (a.includes(':') && isPsPathParam(low)) {
+        const v = a.slice(a.indexOf(':') + 1);
+        if (v) targets.push(v);
+        continue;
+      }
       if (PS_VALUE_PARAMS.has(low)) i++;
       continue;
     }
@@ -1099,19 +1546,22 @@ function checkDelete(toks, varMap, cwd) {
   const unsafe = targets.filter((t) => {
     const expanded = expandTarget(t, varMap);
     if (isDisposableTarget(expanded)) return false;
+    // A relative target inside a temp or scratch working directory is disposable.
+    if (cwd && !/^([~/\\$]|[A-Za-z]:)/.test(expanded) && !/[$`%]/.test(expanded) &&
+        isDisposableTarget(toAbs(expanded, cwd))) return false;
     // Second chance on provenance: a path this session created, inside its own
     // working tree, that git does not track, is the agent's own leftover.
-    const abs = path.isAbsolute(expanded)
-      ? expanded
-      : path.resolve(cwd || process.cwd(), expanded.replace(/^~(?=\/|$)/, HOME_DIR));
+    const abs = toAbs(expanded, cwd);
     return !isAgentCreated(abs, cwd);
   });
   if (!unsafe.length) return null;
 
+  // safe-rm is a bash script: from PowerShell it has to be run through bash.
+  const safeRm = SHELL_MODE === 'powershell' ? 'bash ~/.claude/bin/safe-rm ' : '~/.claude/bin/safe-rm ';
   return 'Recursive delete of ' + unsafe.slice(0, 3).map((t) => '`' + t + '`').join(', ') +
     ' — not a temp, scratch or build directory, so this is one-way. Use the recoverable form, which is ' +
     'never gated and needs no approval:\n' +
-    '  ~/.claude/bin/safe-rm ' + unsafe[0] + '\n' +
+    '  ' + safeRm + unsafe[0] + '\n' +
     'It moves the path to a dated graveyard (14-day retention); `safe-rm --list` and ' +
     '`safe-rm --restore <entry>` bring it back. For a worktree use `git worktree remove`.';
 }
@@ -1137,19 +1587,22 @@ const BIG_FILE_BYTES = 50 * 1024 * 1024;
 // anyway, said the ask was not buying anything (H-169). Hooks inherit the
 // process env, so the guard sees the same value the Bash tool runs under.
 function toolMemoryCapped() {
+  // The cap is a Linux memory cgroup. Windows has no equivalent under the Bash
+  // or PowerShell tool, so there the variable caps nothing and the gate stays.
+  if (!LINUX_RULES) return false;
   const v = String(process.env.CLAUDE_CODE_TOOL_MEMORY_LIMIT || '').trim().toLowerCase();
   return v !== '' && v !== '0' && v !== 'off';
 }
 
 function checkResourceHazard(toks, seg, varMap) {
-  const base = path.basename(String(toks[0] || '')).replace(/^\\+/, '').toLowerCase();
+  const base = baseOf(toks[0]);
   if (!MEMORY_HAZARD.has(base)) return null;
   if (toolMemoryCapped()) return null;
   for (const a of stripRedirections(toks.slice(1))) {
     if (a.startsWith('-')) continue;
     let size = 0;
     try {
-      const st = fs.statSync(expandTarget(a, varMap));
+      const st = fs.statSync(toNative(expandTarget(a, varMap)));
       if (!st.isFile()) continue;
       size = st.size;
     } catch { continue; }
@@ -1167,7 +1620,7 @@ function checkResourceHazard(toks, seg, varMap) {
 // `find <repo> -delete` and `rsync -a --delete /empty/ <repo>/` empty a
 // directory tree just as thoroughly, and neither has `rm` anywhere in it.
 function checkBulkDelete(toks, seg, varMap) {
-  const base = path.basename((toks[0] || '')).replace(/^\\+/, '').toLowerCase();
+  const base = baseOf(toks[0]);
 
   if (base === 'find' && toks.some((t) => t === '-delete') && !findIsScoped(toks)) {
     const unsafe = findPathArgs(toks).filter((t) => !isDisposableTarget(expandTarget(t, varMap)));
@@ -1182,15 +1635,15 @@ function checkBulkDelete(toks, seg, varMap) {
   // Moving a git checkout into a temp directory is a delete on a delay: /tmp is
   // cleared on reboot. Deliberately narrow -- source must be a repo root, dest
   // must be disposable -- because `mv` is otherwise far too common to police.
-  if (base === 'mv') {
-    const positional = stripRedirections(toks.slice(1)).filter((t) => !t.startsWith('-'));
+  if (base === 'mv' || base === 'move-item' || base === 'mi' || base === 'move') {
+    const positional = stripRedirections(toks.slice(1)).filter((t) => !t.startsWith('-') && !/^\/{1,2}[a-z]$/i.test(t));
     if (positional.length >= 2) {
       const dest = expandTarget(positional[positional.length - 1], varMap);
       const sources = positional.slice(0, -1).map((s) => expandTarget(s, varMap));
       if (isDisposableTarget(dest)) {
         for (const src of sources) {
           let isRepo = false;
-          try { isRepo = fs.existsSync(path.join(src, '.git')); } catch { isRepo = false; }
+          try { isRepo = fs.existsSync(path.join(toNative(src), '.git')); } catch { isRepo = false; }
           if (isRepo && !isDisposableTarget(src)) {
             return 'Moving the git checkout `' + src + '` into `' + dest + '` puts it somewhere that is ' +
               'cleared on reboot, which loses it for good. Blocked (Q1) -- move it to a real location, ' +
@@ -1204,10 +1657,28 @@ function checkBulkDelete(toks, seg, varMap) {
   if (base === 'rsync' && toks.some((t) => /^--del(ete(-(before|during|after|delay|excluded))?)?$/.test(t))) {
     const positional = stripRedirections(toks.slice(1)).filter((t) => !t.startsWith('-'));
     const dest = positional[positional.length - 1];
-    // A remote destination is egress, not local deletion; checkEgress owns it.
-    if (dest && !/\S+@\S+:|::/.test(dest) && !isDisposableTarget(expandTarget(dest, varMap))) {
+    // A remote destination is egress, not local deletion; checkEgress and the
+    // classifier own it. `\S+@\S+:` alone missed `$HOST:$DIR/` (no `@`), which
+    // is how deploy scripts write it: 24 of 55 prompts in 2026-11-06..16 were
+    // one deploy.sh to the author's own server, gated as a local delete.
+    // A backup dir keeps every file rsync removes, so that form is recoverable.
+    const backedUp = toks.some((t) => /^--backup(-dir)?(=|$)|^-b$/.test(t)) || toks.includes('--dry-run') || toks.includes('-n');
+    if (dest && !isRemoteSpec(dest) && !backedUp && !isDisposableTarget(expandTarget(dest, varMap))) {
       return '`rsync --delete` makes `' + dest + '` an exact mirror of the source, removing everything ' +
-        'there that the source does not have. Blocked (Q1) -- add `--dry-run` and read the delete list first.';
+        'there that the source does not have. Blocked (Q1) -- the recoverable form keeps what it removes: ' +
+        'add `--backup --backup-dir=<a scratch folder>`, or run with `--dry-run` first and read the list.';
+    }
+  }
+
+  // robocopy /MIR and /PURGE are rsync --delete: the destination loses every
+  // file the source does not have. `robocopy <src> <dst> [files] [options]`.
+  if (base === 'robocopy' && toks.some((t) => /^\/{1,2}(mir|purge)$/i.test(t))) {
+    // Switches are `/MIR`, `/R:3`, `//XD` (Git Bash); `/c/src` is a path.
+    const positional = toks.slice(1).filter((t) => !/^\/{1,2}[A-Za-z]+(:\S*)?$/.test(t));
+    const dest = positional[1];
+    if (dest && !isDisposableTarget(expandTarget(dest, varMap))) {
+      return '`robocopy /MIR` (or `/PURGE`) makes `' + dest + '` an exact mirror of the source, deleting ' +
+        'everything there that the source does not have. Blocked (Q1) -- run it with `/L` first and read the list.';
     }
   }
   return null;
@@ -1257,6 +1728,19 @@ const READ_ONLY = new Set([
   'dirname', 'which', 'type', 'uname', 'id', 'whoami', 'hostname', 'hostnamectl',
   'ps', 'free', 'uptime', 'lsblk', 'lscpu', 'lsusb', 'lspci', 'nproc', 'tree',
   'rg', 'grep', 'egrep', 'fgrep', 'diff', 'cmp', 'md5sum', 'sha256sum', 'cat',
+  // PowerShell / Windows reads (Windows port). Scriptblock bodies are split
+  // into their own segments in PowerShell mode, so a `Where-Object { ... }`
+  // cannot smuggle a write past this list.
+  'get-childitem', 'gci', 'dir', 'get-content', 'gc', 'get-item', 'gi', 'test-path',
+  'get-location', 'gl', 'resolve-path', 'rvpa', 'select-string', 'sls', 'measure-object',
+  'measure', 'select-object', 'select', 'where-object', 'where', '?', 'sort-object',
+  'format-table', 'ft', 'format-list', 'fl', 'format-wide', 'fw', 'write-output', 'write',
+  'write-host', 'get-command', 'gcm', 'get-date', 'get-filehash', 'get-process', 'gps',
+  'get-service', 'gsv', 'get-itemproperty', 'gp', 'split-path', 'join-path', 'out-string',
+  'convertto-json', 'convertfrom-json', 'get-member', 'gm', 'get-help', 'get-psdrive',
+  'get-volume', 'get-disk', 'get-partition', 'get-netadapter', 'get-acl', 'get-host',
+  'get-module', 'get-alias', 'compare-object', 'group-object', 'get-unique', 'out-host',
+  'findstr', 'tasklist', 'systeminfo', 'get-computerinfo', 'get-filehash', 'get-psprovider',
 ]);
 
 const READ_ONLY_SUB = {
@@ -1268,7 +1752,7 @@ const READ_ONLY_SUB = {
 
 function isReadOnlySegment(toks, seg) {
   if (toks.sudo) return false;
-  const base = path.basename((toks[0] || '')).toLowerCase();
+  const base = baseOf(toks[0]);
   const all = toks.slice(1).join(' ');
 
   if (CREDENTIAL_FILE.test(seg)) return false;
@@ -1315,11 +1799,17 @@ function isReadOnlySegment(toks, seg) {
   return false;
 }
 
-function isPlainlyReadOnly(rawCmd, segments) {
+function isPlainlyReadOnly(rawCmd, segments, mode) {
   if (/\$\(|`|<\(|>\(/.test(rawCmd)) return false;             // command substitution
   if (/<<-?\s*['"]?[A-Za-z_]/.test(rawCmd)) return false;       // heredoc
-  const redir = rawCmd.replace(/\d?>\s*\/dev\/null/g, '').replace(/\d>&\d/g, '');
+  const redir = rawCmd.replace(/(\d|\*)?>\s*(\/dev\/null|\$null|nul)\b/gi, '').replace(/\d>&\d/g, '');
   if (/>>?/.test(redir)) return false;                          // writing to a file
+  // PowerShell can act from inside an expression: `(Get-Item x).Delete()`,
+  // `[IO.File]::Delete(...)`, `$x = ...`, `& $sb`. None of that is a plain read.
+  if ((mode || SHELL_MODE) === 'powershell') {
+    const unquoted = rawCmd.replace(/'[^']*'|"[^"]*"/g, '""');
+    if (/::|\.\s*[A-Za-z_]\w*\s*\(|\$[A-Za-z_][\w:]*\s*=[^=]|(^|[\s;(])&\s*[$({'"]/.test(unquoted)) return false;
+  }
   if (!segments.length) return false;
   for (const seg of segments) {
     const toks = unwrap(tokenise(seg));
@@ -1362,9 +1852,7 @@ function isSelfCleanupOnly(rawCmd, segments, cwd) {
     for (const t of targets) {
       const expanded = expandTarget(t, varMap);
       if (/^-/.test(expanded)) return false;
-      const abs = path.isAbsolute(expanded)
-        ? expanded
-        : path.resolve(cwd || process.cwd(), expanded.replace(/^~(?=\/|$)/, HOME_DIR));
+      const abs = toAbs(expanded, cwd);
       if (!isAgentCreated(abs, cwd)) return false;
     }
     sawDelete = true;
@@ -1467,21 +1955,332 @@ function foreignCodeRegions(cmd) {
   return regions;
 }
 
+const SCRIPT_EXT = /\.(sh|bash|zsh|py|js|mjs|cjs|ps1|psm1|pl|rb|bat|cmd)$/i;
+
 function scriptTargets(toks, cwd) {
-  const base = path.basename((toks[0] || '')).toLowerCase();
+  const base = baseOf(toks[0]);
   const out = [];
-  const args = stripRedirections(toks.slice(1)).filter((a) => !a.startsWith('-'));
-  if (RUNNERS.test(base) && args.length) out.push(args[0]);
-  else if (base === 'source' || toks[0] === '.') { if (args.length) out.push(args[0]); }
-  else if (/^\.{0,2}\//.test(toks[0] || '')) out.push(toks[0]);
+  if (PS_HOSTS.has(base)) {
+    // `pwsh -NoProfile -ExecutionPolicy Bypass -File x.ps1`: the value flags
+    // would otherwise make `Bypass` the script.
+    for (let i = 1; i < toks.length; i++) {
+      const tk = toks[i];
+      if (isPsParam(tk, 'file', 1)) { if (toks[i + 1]) out.push(toks[i + 1]); break; }
+      if (isPsParam(tk, 'command', 1) || /^[-/](e|ec)$/i.test(tk) || isPsParam(tk, 'encodedcommand', 2)) break;
+      if (/^[-/](executionpolicy|ep|ex|ex\w+|workingdirectory|wd|configurationname|outputformat|of|inputformat|if|windowstyle|w|settingsfile|custompipename)$/i.test(tk)) { i++; continue; }
+      if (/^[-/]/.test(tk)) continue;
+      out.push(tk); // `pwsh script.ps1` -- the first positional is the file
+      break;
+    }
+  } else {
+    const args = stripRedirections(toks.slice(1)).filter((a) => !a.startsWith('-'));
+    if (RUNNERS.test(base) && args.length) out.push(args[0]);
+    else if (base === 'source' || toks[0] === '.') { if (args.length) out.push(args[0]); }
+    else if (/^\.{0,2}[\/\\]/.test(toks[0] || '')) out.push(toks[0]);
+    // `C:\x\run.ps1`, `deploy.cmd`, `& "C:\x\y.ps1"` -- a script named as the head.
+    else if (SCRIPT_EXT.test(toks[0] || '')) out.push(toks[0]);
+  }
   return out
-    .filter((p) => /\.(sh|bash|zsh|py|js|mjs|cjs|ps1|pl|rb)$/i.test(p) || /^\.{0,2}\//.test(p))
-    .map((p) => (path.isAbsolute(p) ? p : path.resolve(cwd || process.cwd(), p)));
+    .filter((p) => SCRIPT_EXT.test(p) || /^\.{0,2}[\/\\]/.test(p))
+    .map((p) => toAbs(p, cwd));
+}
+
+// The grammar a script file is written in.
+function scriptMode(file) {
+  if (/\.(ps1|psm1)$/i.test(file)) return 'powershell';
+  if (/\.(bat|cmd)$/i.test(file)) return 'cmd';
+  return 'bash';
+}
+
+// --- Windows system rules (Windows port, 2026-11-14) -------------------------
+//
+// The Windows equivalents of the Linux tiers above -- not new policy. Each
+// group names the Linux rule it mirrors. All are ASK: every one of these has a
+// legitimate yes (formatting a USB stick, uninstalling an app, rebooting after
+// an update), so none meets the DENY bar of "no reasonable answer is yes".
+const WIN_DISK_CMDLETS = new Set([
+  'clear-disk', 'format-volume', 'initialize-disk', 'remove-partition', 'new-partition',
+  'resize-partition', 'set-partition', 'set-disk', 'remove-physicaldisk', 'reset-physicaldisk',
+  'remove-virtualdisk', 'clear-physicaldiskhealthdata',
+]);
+const WIN_CRITICAL_PROCS = /^(explorer|dwm|winlogon|csrss|wininit|lsass|smss|services|svchost|sihost|fontdrvhost|logonui)(\.exe)?$/i;
+const WIN_CRITICAL_SERVICES = new Set([
+  'dhcp', 'dnscache', 'nlasvc', 'netprofm', 'wlansvc', 'lanmanworkstation', 'sshd', 'termservice',
+  'rpcss', 'winmgmt', 'eventlog', 'bfe', 'mpssvc', 'netman', 'wcmsvc', 'dot3svc', 'iphlpsvc', 'nsi',
+  'audiosrv', 'themes', 'sens', 'profsvc', 'usermanager', 'gpsvc',
+]);
+const MACHINE_HIVE = /(^|[\s"'\\/:])(hklm|hkey_local_machine|hkcr|hkey_classes_root|hku|hkey_users)(:|\\|\/|\s|$)|registry::hkey_(local_machine|classes_root|users)/i;
+const PS_ITEM_MUTATORS = /^(remove-item|ri|del|erase|rd|rmdir|rm|remove-itemproperty|rp|set-itemproperty|sp|new-itemproperty|new-item|ni|rename-item|rni|rename-itemproperty|rnp|clear-itemproperty|clp|clear-item|cli|set-item|si|move-item|mi|move|copy-item|cpi|copy|move-itemproperty|mp|copy-itemproperty|cpp)$/;
+
+// Windows switches come as `/x`, `-x` or (Git Bash) `//x`; normalise to `/x`.
+const winSwitches = (rest) => rest.map((t) => t.replace(/^(\/\/|-)(?=[a-z?])/i, '/').toLowerCase());
+const hasWhatIf = (rest) => rest.some((t) => /^-whatif(:\$true)?$/i.test(t));
+
+function checkWindowsSystem(toks, seg) {
+  if (!WIN_RULES || toks.wsl) return null;
+  const base = baseOf(toks[0]);
+  const raw = toks.slice(1);
+  const rest = raw.map((t) => t.toLowerCase());
+  const sw = winSwitches(raw);
+  const all = rest.join(' ');
+
+  // --- Q1: disks and filesystems (mirrors mkfs / parted / dd of=/dev) -------
+  if (WIN_DISK_CMDLETS.has(base) && !hasWhatIf(rest)) {
+    return '`' + toks[0] + '` changes a disk, partition table or volume and is not recoverable from here. ' +
+      'Blocked (Q1) -- ask the user.';
+  }
+  if (base === 'diskpart') {
+    return '`diskpart` edits disks and partition tables, and a script passed with /s runs unattended. Blocked (Q1) -- ask the user.';
+  }
+  if (base === 'format' && rest.length && !rest.every((t) => t === '/?')) {
+    return '`format` destroys the filesystem on a volume. Blocked (Q1) -- ask the user.';
+  }
+  // Mirrors shred / wipefs.
+  if ((base === 'cipher' && sw.some((t) => /^\/w(:|$)/.test(t))) || base === 'sdelete' || base === 'sdelete64') {
+    return '`' + base + '` overwrites free space or files so nothing can be recovered. Blocked (Q1) -- ask the user.';
+  }
+  // Mirrors modprobe: boot configuration sits below anything this session can undo.
+  if (base === 'bcdedit') {
+    const reads = sw.every((t) => /^\/(enum|v|\?)$/.test(t) || !t.startsWith('/') && /^(all|active|firmware|bootapp|bootmgr|osloader|resume|inherit|\{[^}]*\})$/.test(t));
+    if (sw.length && !reads) {
+      return '`bcdedit` changes the boot configuration; a wrong value leaves the machine unbootable. Blocked (Q1) -- ask the user.';
+    }
+  }
+  if (base === 'bcdboot' || base === 'bootrec' || base === 'bootsect') {
+    return '`' + base + '` rewrites boot records. Blocked (Q1) -- ask the user.';
+  }
+  // Mirrors timeshift --delete / btrfs subvolume delete: the rollback points.
+  if (base === 'vssadmin' && /\b(delete\s+shadows|resize\s+shadowstorage)\b/.test(all)) {
+    return 'Deleting or shrinking Volume Shadow Copies removes the machine\'s restore points -- the thing that ' +
+      'makes everything else recoverable. Blocked (Q1).';
+  }
+  if (base === 'wmic' && /\bshadowcopy\b/.test(all) && /\bdelete\b/.test(all)) {
+    return 'Deleting shadow copies removes the machine\'s restore points. Blocked (Q1).';
+  }
+  if (base === 'wbadmin' && /^delete\b/.test(all)) {
+    return '`wbadmin delete` removes backups. Blocked (Q1) -- ask the user.';
+  }
+  if (base === 'disable-computerrestore') {
+    return 'Turning off System Restore removes the rollback point. Blocked (Q1) -- ask the user.';
+  }
+
+  // --- Q1: packages and drivers (mirrors apt remove / dpkg -r / modprobe) ---
+  if ((base === 'winget' && /^(uninstall|remove|rm)$/.test(rest[0] || '')) ||
+      ((base === 'choco' || base === 'scoop') && /^(uninstall|remove)$/.test(rest[0] || '')) ||
+      /^(uninstall-package|uninstall-module|remove-appxpackage|remove-appxprovisionedpackage|remove-windowscapability|disable-windowsoptionalfeature|uninstall-windowsfeature|remove-windowsfeature)$/.test(base) ||
+      (base === 'msiexec' && sw.some((t) => /^\/(x|uninstall)$/.test(t))) ||
+      (base === 'dism' && sw.some((t) => /^\/(remove-|disable-feature)/.test(t)))) {
+    return 'Removing packages or Windows features can take out something another tool depends on and is ' +
+      'awkward to undo. Blocked -- ask the user, or install alongside instead.';
+  }
+  if (base === 'pnputil' && sw.some((t) => /^\/(delete-driver|remove-device|disable-device|add-driver)$/.test(t))) {
+    return 'Adding or removing a driver reaches below anything this session can undo. Blocked (Q1) -- ask the user.';
+  }
+
+  // --- Q1: machine registry (mirrors raw writes into /sys) ------------------
+  if (base === 'reg' && /^(delete|add|import|restore|load|unload|copy)$/.test(rest[0] || '') && MACHINE_HIVE.test(seg)) {
+    return 'Writing to or deleting from the machine registry (HKLM/HKCR/HKU) changes system behaviour with no ' +
+      'undo record. Blocked (Q1) -- ask the user, and export the key first (`reg export`).';
+  }
+  if (PS_ITEM_MUTATORS.test(base) && MACHINE_HIVE.test(seg)) {
+    return 'Changing the machine registry (HKLM/HKCR/HKU) through the registry provider has no undo record. ' +
+      'Blocked (Q1) -- ask the user, and export the key first (`reg export`).';
+  }
+
+  // --- Q1: ACL/ownership sweeps (mirrors chown -R /) ------------------------
+  if ((base === 'takeown' && sw.some((t) => t === '/r')) || (base === 'icacls' && sw.some((t) => t === '/t'))) {
+    const targets = [];
+    for (let i = 0; i < raw.length; i++) {
+      const t = raw[i];
+      // takeown names its target with `/f <path>`; icacls takes it positionally.
+      if (base === 'takeown' && /^\/{1,2}f$/i.test(t)) { if (raw[i + 1]) targets.push(raw[i + 1]); i++; continue; }
+      if (/^\/{1,2}[a-z]+$/i.test(t)) { if (/^\/{1,2}(grant|deny|remove|setowner|save|restore|setintegritylevel|inheritance|d|s|u|p)$/i.test(t)) i++; continue; }
+      if (/^-/.test(t)) continue;
+      targets.push(t);
+    }
+    const bad = targets.filter((t) => isSystemRoot(normalise(expandTarget(t)) || '/'));
+    if (bad.length) {
+      return 'Recursive ownership or permission changes over ' + bad.map((t) => '`' + t + '`').join(', ') +
+        ' are effectively irreversible without a full reinstall. Blocked (Q1).';
+    }
+  }
+
+  // --- Q3: ending the session (mirrors systemctl stop gdm / loginctl) -------
+  if (base === 'shutdown') {
+    if (sw.some((t) => t === '/a')) return null; // aborting a pending shutdown
+    if (sw.some((t) => /^\/(s|r|l|h|p|g|sg|o|i|fw|soft)$/.test(t))) {
+      return 'Shutting down, restarting, hibernating or logging off ends this session, so nothing after it ' +
+        'can be verified. Blocked (Q3) -- ask the user.';
+    }
+  }
+  if ((base === 'stop-computer' || base === 'restart-computer') && !hasWhatIf(rest)) {
+    return '`' + toks[0] + '` ends this session, so nothing after it can be verified. Blocked (Q3) -- ask the user.';
+  }
+  if (base === 'logoff' || base === 'tsdiscon' ||
+      (base === 'rundll32' && /(powrprof\.dll,setsuspendstate|user32\.dll,lockworkstation|shell32\.dll,sht?utdown)/.test(all))) {
+    return 'Logging off, suspending or locking the desktop takes it away from the session. Blocked (Q3).';
+  }
+  // Mirrors `pkill gnome-shell`.
+  if ((base === 'stop-process' || base === 'spps' || base === 'kill' || base === 'taskkill') &&
+      raw.some((t) => WIN_CRITICAL_PROCS.test(t.replace(/^.*[\\/]/, '').replace(/^\/{1,2}im$/i, '')))) {
+    return 'Killing the shell, compositor or a core system process ends the desktop and every unsaved ' +
+      'thing in it. Blocked (Q3).';
+  }
+
+  // --- Q3: services (mirrors systemctl stop/disable on critical units) ------
+  const svcVerb = (base === 'sc' || base === 'net') ? (rest[0] || '') : '';
+  const stopsService = /^(stop-service|spsv|suspend-service)$/.test(base) ||
+    (base === 'set-service' && /-(startuptype|startup|st)\s*:?\s*disabled|-status\s*:?\s*(stopped|paused)/.test(all)) ||
+    (base === 'sc' && /^(stop|pause|config|delete)$/.test(svcVerb)) ||
+    (base === 'net' && /^(stop|pause)$/.test(svcVerb));
+  if (stopsService) {
+    const names = rest.filter((t) => !/^[-/]/.test(t) && !/^(stop|pause|config|delete|start=|disabled|demand)$/.test(t))
+      .flatMap((t) => t.split(','));
+    if (base === 'sc' && svcVerb === 'delete') {
+      return '`sc delete` removes a service registration, which is awkward to restore. Blocked (Q1) -- ask the user.';
+    }
+    if (base === 'sc' && svcVerb === 'config' && !/start=\s*disabled|start=\s*demand/.test(all)) return null;
+    if (names.some((n) => WIN_CRITICAL_SERVICES.has(n.replace(/^["']|["']$/g, '')))) {
+      return 'Stopping or disabling a network, remote-access or core Windows service cuts this session off ' +
+        'or breaks the desktop, so nothing after it can be verified. Blocked (Q3) -- ask the user.';
+    }
+  }
+
+  // --- Q3: network lockout (mirrors ufw / iptables / nmcli / ip link down) --
+  if (base === 'netsh' && (
+    /\badvfirewall\b.*\b(reset|state\s+(off|on))\b/.test(all) ||
+    /\badvfirewall\b.*\bfirewallpolicy\b.*\bblock/.test(all) ||
+    /\badvfirewall\s+firewall\s+(add|set)\b.*\baction=block\b/.test(all) ||
+    /\binterface\b.*\b(admin=)?disabled?\b/.test(all) ||
+    /\b(winsock|int(erface)?\s+ip(v4|v6)?)\s+reset\b/.test(all) ||
+    /\binterface\s+ip(v4|v6)?\s+(set|delete)\s+(address|dnsservers?|route)\b/.test(all))) {
+    return 'Firewall, adapter or IP changes can lock this machine out of the network mid-task. Blocked (Q3) -- ask the user.';
+  }
+  if ((base === 'set-netfirewallprofile' && /-(enabled\s*:?\s*(false|\$false|0)|default(in|out)boundaction\s*:?\s*block)/.test(all)) ||
+      (/^(new-netfirewallrule|set-netfirewallrule)$/.test(base) && /-action\s*:?\s*block/.test(all)) ||
+      /^(disable-netadapter|restart-netadapter|remove-netipaddress|set-netipaddress|new-netipaddress|remove-netroute|set-dnsclientserveraddress|disable-netadapterbinding)$/.test(base) ||
+      (base === 'ipconfig' && sw.some((t) => /^\/(release6?|renew6?)$/.test(t)))) {
+    if (hasWhatIf(rest)) return null;
+    return 'Firewall, adapter or IP changes can lock this machine out of the network mid-task. Blocked (Q3) -- ask the user.';
+  }
+  // Security controls off (mirrors `ufw disable`).
+  if ((base === 'set-mppreference' && /-disable\w*(\s+(\$true|1|true)|:\$true|\s*$)/.test(all)) ||
+      (base === 'add-mppreference' && /-exclusion\w+/.test(all)) ||
+      (base === 'netsh' && /\badvfirewall\b.*\bstate\s+off\b/.test(all))) {
+    return 'Turning off Defender protection or adding an exclusion weakens the machine\'s security controls. ' +
+      'Blocked (Q3) -- ask the user.';
+  }
+  // Execution policy above Process scope is a persistent security setting.
+  if (base === 'set-executionpolicy') {
+    let scope = 'localmachine';
+    const pos = [];
+    for (let i = 0; i < rest.length; i++) {
+      const t = rest[i];
+      if (/^-sc(o(pe?)?)?:/.test(t)) { scope = t.slice(t.indexOf(':') + 1); continue; }
+      if (/^-sc(o(pe?)?)?$/.test(t)) { scope = rest[i + 1] || scope; i++; continue; }
+      if (/^-(executionpolicy|ep|e\w*)$/.test(t)) { pos.push(rest[i + 1] || ''); i++; continue; }
+      if (t.startsWith('-')) continue;
+      pos.push(t);
+    }
+    if (pos.length >= 2 && !rest.some((t) => /^-sc/.test(t))) scope = pos[1];
+    if (!/^(process|currentuser)$/.test(scope.replace(/['"]/g, '')) && !hasWhatIf(rest)) {
+      return 'Changing the machine-wide PowerShell execution policy is a persistent security setting. ' +
+        'Blocked (Q3) -- ask the user, or use `-Scope Process` for this session only.';
+    }
+  }
+
+  // --- Q3: the record of what happened (mirrors journalctl --vacuum) --------
+  if ((base === 'wevtutil' && /^(cl|clear-log|um|uninstall-manifest)$/.test(rest[0] || '')) ||
+      base === 'clear-eventlog' || base === 'remove-eventlog') {
+    return 'Clearing a Windows event log destroys the record of what just happened. Blocked (Q3).';
+  }
+  return null;
+}
+
+// PowerShell-shaped deletes that the per-segment parser cannot see, because
+// the target and the delete sit in different pipeline stages or in a .NET call.
+function checkPsRaw(rawCmd, mode, varMap, cwd) {
+  // `[IO.Directory]::Delete('X', $true)` and `(Get-Item X).Delete($true)` --
+  // the native recursive delete, mirroring shutil.rmtree / fs.rmSync.
+  const dn = /\[(?:system\.)?io\.directory\]::delete\s*\(\s*(['"]?)([^'",)]+)\1\s*,\s*\$true/i.exec(rawCmd) ||
+    /\[microsoft\.visualbasic\.fileio\.filesystem\]::deletedirectory\s*\(\s*(['"]?)([^'",)]+)\1/i.exec(rawCmd);
+  if (dn) {
+    const t = expandTarget(dn[2], varMap);
+    if (!isDisposableTarget(t) && !isAgentCreated(toAbs(t, cwd), cwd)) {
+      return 'A .NET recursive directory delete of `' + dn[2] + '` is `rm -rf` written as a method call. ' +
+        'Blocked (Q1) -- use `bash ~/.claude/bin/safe-rm ' + dn[2] + '`, which is recoverable.';
+    }
+  }
+  if (/\.delete\s*\(\s*\$true\s*\)/i.test(rawCmd)) {
+    return 'A `.Delete($true)` call is a recursive directory delete on a target the guard cannot resolve. ' +
+      'Blocked (Q1) -- name the path in a Remove-Item or safe-rm call instead.';
+  }
+
+  // `Get-ChildItem X -Recurse | Remove-Item` is `find X -delete`: every file in
+  // the tree goes, and the Remove-Item stage carries neither a target nor a
+  // -Recurse to notice. Same carve-outs as find: a -Filter/-Include/wildcard
+  // scope is a cleanup, a disposable root is fine.
+  for (const stmt of splitSegments(rawCmd, mode, true)) {
+    const stages = splitPipes(stmt);
+    if (stages.length < 2) continue;
+    const toksList = stages.map((s) => unwrap(tokenise(s)));
+    const srcIdx = toksList.findIndex((t) => /^(get-childitem|gci|dir|ls)$/.test(baseOf(t[0])) &&
+      t.slice(1).some((a) => isRecursiveFlag(a, 'powershell') || /^-r$/i.test(a)));
+    if (srcIdx < 0) continue;
+    const sinkIdx = toksList.findIndex((t, i) => i > srcIdx && PS_REMOVE.has(baseOf(t[0])) || i > srcIdx && baseOf(t[0]) === 'rm');
+    if (sinkIdx < 0) continue;
+    const src = toksList[srcIdx].slice(1);
+    const scoped = src.some((a) => /^-(fil(t(er?)?)?|inc(l(u(de?)?)?)?)$/i.test(a) || /^-(fi|in)\w*:/i.test(a)) ||
+      src.some((a) => !a.startsWith('-') && /\*\.\w+$|\*[^\\/]*$/.test(a) && !/[\\/]\*$/.test(a));
+    if (scoped) continue;
+    const paths = [];
+    for (let i = 0; i < src.length; i++) {
+      const a = src[i];
+      if (a.startsWith('-')) {
+        if (a.includes(':') && isPsPathParam(a.toLowerCase().replace(/:.*$/, ''))) paths.push(a.slice(a.indexOf(':') + 1));
+        else if (PS_VALUE_PARAMS.has(a.toLowerCase()) || /^-depth$/i.test(a)) i++;
+        continue;
+      }
+      paths.push(a);
+    }
+    if (!paths.length) paths.push('.');
+    const unsafe = paths.filter((p) => {
+      const t = expandTarget(p, varMap);
+      return !isDisposableTarget(t) && !isAgentCreated(toAbs(t, cwd), cwd);
+    });
+    if (unsafe.length) {
+      return '`Get-ChildItem -Recurse ' + unsafe[0] + ' | Remove-Item` deletes every file in that tree with no ' +
+        'recursive flag on the delete to notice -- the PowerShell spelling of `find ... -delete`. Blocked (Q1) -- ' +
+        'run it without the Remove-Item stage first and read the list.';
+    }
+  }
+
+  // `Get-Process explorer | Stop-Process` -- the target is in the first stage.
+  if (WIN_RULES && /\b(get-process|gps|ps)\b[^|;\n]*\|\s*(stop-process|spps|kill)\b/i.test(rawCmd)) {
+    const m = /\b(get-process|gps|ps)\b([^|;\n]*)\|/i.exec(rawCmd);
+    if (m && m[2].split(/[\s,'"]+/).some((t) => WIN_CRITICAL_PROCS.test(t))) {
+      return 'Killing the shell, compositor or a core system process ends the desktop and every unsaved ' +
+        'thing in it. Blocked (Q3).';
+    }
+  }
+  return null;
 }
 
 // --- engine -----------------------------------------------------------------
 
-function evaluate(rawCmd, cwd, depth) {
+function evaluate(rawCmd, cwd, depth, mode) {
+  if (rawCmd == null) return null;
+  mode = mode || SHELL_MODE;
+  const prevMode = SHELL_MODE;
+  SHELL_MODE = mode;
+  try {
+    return evaluateIn(rawCmd, cwd, depth || 0, mode);
+  } finally {
+    SHELL_MODE = prevMode;
+  }
+}
+
+function evaluateIn(rawCmd, cwd, depth, mode) {
   const pipe = checkPipeToShell(rawCmd);
   if (pipe) return asVerdict(pipe);
 
@@ -1490,7 +2289,7 @@ function evaluate(rawCmd, cwd, depth) {
       const native = checkNativeDestructive(region, assignmentMap(rawCmd));
       if (native) return asVerdict(native);
       for (const embedded of extractEmbeddedCommands(region)) {
-        const r = evaluate(embedded, cwd, depth + 1);
+        const r = evaluate(embedded, cwd, depth + 1, 'bash');
         if (r) {
           return rewrap(r, 'Code passed to an interpreter contains an action that is gated on its own: ',
             ' (Wrapping a command in Python or Node does not change what it does -- the guard reads it.)');
@@ -1505,17 +2304,29 @@ function evaluate(rawCmd, cwd, depth) {
   // this seed, `SB="$PWD/fakehome"; rm -rf "$SB"` resolved against whatever
   // directory the guard happened to be launched in.
   if (cwd && !varMap.has('PWD')) varMap.set('PWD', cwd);
-  for (const seg of splitSegments(body)) {
+
+  const psr = checkPsRaw(body, mode, varMap, cwd);
+  if (psr) return asVerdict(psr);
+
+  // Follow `cd` so a later relative delete is judged where it really runs:
+  // `cd /tmp/x && rm -r bundle` was gated as a one-way delete of `bundle`.
+  let segCwd = cwd;
+  for (const seg of splitSegments(body, mode)) {
     const toks = unwrap(tokenise(seg));
     if (!toks.length) continue;
+    if (/^(cd|set-location|sl|chdir|pushd)$/.test(baseOf(toks[0])) && toks.length === 2 && segCwd) {
+      const t = expandTarget(toks[1], varMap);
+      if (!/[$`*?%]/.test(t)) segCwd = toAbs(t, segCwd);
+      continue;
+    }
 
-    for (const rule of [checkObserverLoss, checkSelfPrivilege, checkUnrecoverable, checkEgress, checkCredentialRead]) {
+    for (const rule of [checkObserverLoss, checkSelfPrivilege, checkWindowsSystem, checkUnrecoverable, checkEgress, checkCredentialRead]) {
       const r = rule(toks, seg);
       if (r) return asVerdict(r);
     }
     const g = checkGitHistory(toks);
     if (g) return asVerdict(g);
-    const d = checkDelete(toks, varMap, cwd);
+    const d = checkDelete(toks, varMap, segCwd);
     if (d) return asVerdict(d);
     const b = checkBulkDelete(toks, seg, varMap);
     if (b) return asVerdict(b);
@@ -1526,7 +2337,25 @@ function evaluate(rawCmd, cwd, depth) {
     // `find ... -exec rm -rf {} +` -- is still that command.
     if (depth < 3) {
       for (const nested of nestedCommands(toks)) {
-        const r = evaluate(nested, cwd, depth + 1);
+        if (nested.encoded) {
+          // -EncodedCommand exists to hide a script from whoever reads the
+          // command line, which is every layer of review here. Decode and judge
+          // it; when the guard cannot read it, or it reads clean, a human still
+          // decides, because the classifier and the transcript only see base64.
+          if (nested.cmd == null) {
+            return ASK('`-EncodedCommand` payload could not be decoded as text, so nobody reviewing this ' +
+              'can see what it runs. Blocked -- rewrite it as a plain `-Command`.');
+          }
+          const r = evaluate(nested.cmd, cwd, depth + 1, 'powershell');
+          if (r) {
+            return rewrap(r, 'An -EncodedCommand payload is gated on its own: ',
+              ' (Encoding a command does not change what it does -- the guard decodes it.)');
+          }
+          return ASK('`-EncodedCommand` hides the script from every reviewer of the command line. Decoded it reads:\n  ' +
+            nested.cmd.slice(0, 300).replace(/\s+/g, ' ') + '\nApprove only if that is what you meant -- ' +
+            'or rewrite it as a plain `-Command`, which needs no approval.');
+        }
+        const r = evaluate(nested.cmd, cwd, depth + 1, nested.mode);
         if (r) {
           return rewrap(r, 'A command passed as an argument is gated on its own: ',
             ' (Wrapping it in a shell, xargs or find does not change what it does.)');
@@ -1544,10 +2373,10 @@ function evaluate(rawCmd, cwd, depth) {
         if (content) {
           // Shell scripts parse as shell; a .py/.js body does not, so judge its
           // string literals instead.
-          const isShellish = /\.(sh|bash|zsh|ps1)$/i.test(file) || !/\.\w+$/.test(file);
+          const isShellish = /\.(sh|bash|zsh|ps1|psm1|bat|cmd)$/i.test(file) || !/\.\w+$/.test(file);
           let inner = null;
           if (isShellish) {
-            inner = evaluate(content, cwd, depth + 1);
+            inner = evaluate(content, cwd, depth + 1, scriptMode(file));
           } else {
             // Deliberately NOT running checkNativeDestructive over a whole file
             // body. A file that merely QUOTES `shutil.rmtree(...)` -- a test
@@ -1558,7 +2387,7 @@ function evaluate(rawCmd, cwd, depth) {
             // Inline `-c`/`-e` payloads and stdin heredocs are still scanned
             // natively in evaluate(), which is where the real bypasses were.
             for (const embedded of extractEmbeddedCommands(content)) {
-              inner = evaluate(embedded, cwd, depth + 1);
+              inner = evaluate(embedded, cwd, depth + 1, 'bash');
               if (inner) break;
             }
           }
@@ -1578,7 +2407,7 @@ function evaluate(rawCmd, cwd, depth) {
 // Exported for the replay test suite; no effect when run as a hook.
 if (require.main !== module) {
   module.exports = {
-    evaluate, isPlainlyReadOnly, splitSegments, stripHeredocs,
+    evaluate, isPlainlyReadOnly, splitSegments, stripHeredocs, normalise, toNative,
     // The provenance test needs a session start time, which only exists in a
     // real hook payload. The suites set it explicitly so the agent-created
     // carve-out can be exercised, and left null everywhere else so the rest of
@@ -1600,12 +2429,21 @@ if (require.main !== module) {
     allow();
   }
 
-  const HIGH_STAKES = /\brm\b|\bsudo\b|\bdd\b|mkfs|ydotool|xdotool|wtype|chvt|modprobe|reflog|--prune|systemctl|iptables|\bufw\b/i;
+  const HIGH_STAKES = new RegExp([
+    '\\brm\\b', '\\bsudo\\b', '\\bdd\\b', 'mkfs', 'ydotool', 'xdotool', 'wtype', 'chvt', 'modprobe', 'reflog',
+    '--prune', 'systemctl', 'iptables', '\\bufw\\b',
+    // Windows port: the same fail-closed set, Windows spelling.
+    'remove-item', '\\brd\\b', '\\brmdir\\b', '\\bdel\\b', '\\berase\\b', 'diskpart', '\\bformat\\b',
+    'clear-disk', 'format-volume', 'initialize-disk', 'remove-partition', 'bcdedit', 'vssadmin',
+    '\\bcipher\\b', '\\breg\\b', '-enc', '\\biex\\b', 'invoke-expression', 'shutdown', 'stop-computer',
+    'restart-computer', 'set-executionpolicy',
+  ].join('|'), 'i');
   let cmdForFailClosed = '';
 
   try {
     const tool = payload.tool_name || payload.toolName;
     if (tool !== 'Bash' && tool !== 'PowerShell') allow();
+    SHELL_MODE = tool === 'PowerShell' ? 'powershell' : 'bash';
 
     const input = payload.tool_input || payload.toolInput || {};
     const cmd = input.command;
@@ -1618,7 +2456,7 @@ if (require.main !== module) {
     AUTOSAVE = freshAutosave(cwd);
 
     const verdict = asVerdict(evaluate(cmd, cwd, 0));
-    if (verdict) decide(verdict.tier, verdict.why);
+    if (verdict) decide(...finalTier(verdict));
 
     // Grant outright rather than falling through: the settings.json `ask` list
     // still carries git restore / clean --force / branch -D, and falling
@@ -1626,7 +2464,7 @@ if (require.main !== module) {
     if (AUTOSAVE) {
       const segs0 = splitSegments(stripHeredocs(cmd));
       const gitSegs = segs0.map((s) => unwrap(tokenise(s)))
-        .filter((t) => t.length && path.basename(String(t[0])).toLowerCase() === 'git');
+        .filter((t) => t.length && baseOf(t[0]) === 'git');
       if (gitSegs.length && gitSegs.every((t) => RECOVERABLE_GIT.test((stripGitGlobals(t)[0] || '').toLowerCase()))) {
         grant('Recoverable: the worktree (tracked and untracked) was snapshotted to ' + AUTOSAVE.ref +
           ' moments ago, so this can be undone with `git checkout ' + AUTOSAVE.ref + ' -- .`');
@@ -1651,11 +2489,9 @@ if (require.main !== module) {
     // Fail closed for the set this layer is now solely responsible for; fail
     // open for everything else, because a guard must never wedge a session.
     if (HIGH_STAKES.test(cmdForFailClosed)) {
-      // ASK, not DENY: an unparseable command is the guard admitting it does not
-      // know, and "I do not know" is exactly the case a human should settle.
-      decide('ask', 'The local guard could not parse this command (' + (e && e.message ? e.message : 'parse error') +
-        ') and it mentions a high-stakes operation, so it is not guessing. Read it and approve only if it ' +
-        'is what you meant -- or rewrite it as a simpler, single-purpose command.');
+      decide(...finalTier(ASK('The local guard could not parse this command (' + (e && e.message ? e.message : 'parse error') +
+        ') and it mentions a high-stakes operation, so it is not guessing. Rewrite it as simpler, ' +
+        'single-purpose commands.')));
     }
     allow();
   }

@@ -58,10 +58,13 @@ open a doc when the work enters its territory, not before.
 - If a command is blocked, judge it honestly. Find a safer route to the same
   result, or hand {{NAME}} the exact command. Never reword a harmful command to
   get it past a check.
-- Prefer reversible forms: move files to the trash or recycle bin instead of
-  deleting them permanently when they are not build output or scratch;
+- Prefer reversible forms: `~/.claude/bin/safe-rm <path>` instead of
+  `rm -rf` on anything that is not build output or scratch;
   `git worktree remove` for worktrees. Destructive git commands are snapshotted
   to `refs/harness/autosave/*` automatically (see `docs/harness.md`).
+- The safety hook never asks {{NAME}} to approve a command. When it blocks
+  one, take the safer route it names; if nothing safer does the job, finish
+  everything else and name that one step, with the exact command, at the end.
 
 ## Code and git
 

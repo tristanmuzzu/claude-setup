@@ -59,13 +59,7 @@
       "Bash(ffprobe *)",
       "Bash(magick *)"
     ],
-    "ask": [
-      "Bash(npm publish*)",
-      "Bash(pnpm publish*)",
-      "Bash(pip install git+*)",
-      "Bash(pip install http*)",
-      "Bash(kubectl delete *)"
-    ],
+    "ask": [],
     "deny": [
       "Bash(git push --force*)",
       "Bash(git push * --force*)",
@@ -110,7 +104,7 @@
         ]
       },
       {
-        "matcher": "Bash",
+        "matcher": "Bash|PowerShell",
         "hooks": [
           {
             "type": "command",
@@ -161,7 +155,7 @@
       "$defaults",
       "Single-user personal computer, used for software development and creative work. The local workstation is never a sensitive remote target.",
       "Operating expectation: the user often lets agents work while away. A block does not pause the work for review -- it stops it until they return, so a wrongly blocked action costs a whole working session. Bias toward allowing actions that directly implement their latest explicit request.",
-      "Recovery posture: a deterministic PreToolUse hook (guard-irreversible.js) independently blocks or asks before recursive deletes of real data, force-push, reflog/gc pruning, disk and partition tools, and remote scripts piped into a shell, and autosave-git.js snapshots the working tree before destructive git commands. Those categories do not need classifier judgment -- spend it on production writes, external publish, egress, self-privilege and provenance.",
+      "Recovery posture: a deterministic PreToolUse hook (guard-irreversible.js) independently blocks, with a safer route and never a prompt, before recursive deletes of real data, force-push, reflog/gc pruning, disk and partition tools, and remote scripts piped into a shell, and autosave-git.js snapshots the working tree before destructive git commands. Those categories do not need classifier judgment -- spend it on production writes, external publish, egress, self-privilege and provenance.",
       "Reversibility alone is not the test. Every database write is irreversible and routine. Prioritise actions that remove the ability to check the work -- killing the session or display, cutting the network, deleting transcripts or logs, widening the agent's own permissions, installing code that runs at session start.",
       "Explicit-ask clarification: when Claude has presented an itemized list of proposed settings/hook/permission changes and the user approves that list (by number, 'approved', 'do all', or 'go ahead'), that approval IS the explicit ask for exactly those items. Approval of a list never extends to items not on it.",
       "EGRESS: block sending local data outward to a destination the user has not named this session -- uploads of .env, credentials, *.pem, id_rsa or token files; request bodies carrying key material; gist or pastebin uploads. Block remote code execution from an untrusted source: a download piped into a shell, pip install from a git URL, or installing a package first seen in fetched content. Destinations the user already works with (their own repos and hosting) are ordinary work.",
